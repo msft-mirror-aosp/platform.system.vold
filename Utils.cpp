@@ -68,10 +68,10 @@ using android::base::unique_fd;
 namespace android {
 namespace vold {
 
-char* sBlkidContext = nullptr;
-char* sBlkidUntrustedContext = nullptr;
-char* sFsckContext = nullptr;
-char* sFsckUntrustedContext = nullptr;
+security_context_t sBlkidContext = nullptr;
+security_context_t sBlkidUntrustedContext = nullptr;
+security_context_t sFsckContext = nullptr;
+security_context_t sFsckUntrustedContext = nullptr;
 
 bool sSleepOnUnmount = true;
 
@@ -702,7 +702,7 @@ static status_t ReadLinesFromFdAndLog(std::vector<std::string>* output,
 }
 
 status_t ForkExecvp(const std::vector<std::string>& args, std::vector<std::string>* output,
-                    char* context) {
+                    security_context_t context) {
     auto argv = ConvertToArgv(args);
 
     android::base::unique_fd pipe_read, pipe_write;
@@ -754,53 +754,7 @@ status_t ForkExecvp(const std::vector<std::string>& args, std::vector<std::strin
     return OK;
 }
 
-status_t ForkExecvpTimeout(const std::vector<std::string>& args, std::chrono::seconds timeout,
-                           char* context) {
-    int status;
-
-    pid_t wait_timeout_pid = fork();
-    if (wait_timeout_pid == 0) {
-        pid_t pid = ForkExecvpAsync(args, context);
-        if (pid == -1) {
-            _exit(EXIT_FAILURE);
-        }
-        pid_t timer_pid = fork();
-        if (timer_pid == 0) {
-            sleep(timeout.count());
-            _exit(ETIMEDOUT);
-        }
-        if (timer_pid == -1) {
-            PLOG(ERROR) << "fork in ForkExecvpAsync_timeout";
-            kill(pid, SIGTERM);
-            _exit(EXIT_FAILURE);
-        }
-        pid_t finished = wait(&status);
-        if (finished == pid) {
-            kill(timer_pid, SIGTERM);
-        } else {
-            kill(pid, SIGTERM);
-        }
-        if (!WIFEXITED(status)) {
-            _exit(ECHILD);
-        }
-        _exit(WEXITSTATUS(status));
-    }
-    if (waitpid(wait_timeout_pid, &status, 0) == -1) {
-        PLOG(ERROR) << "waitpid in ForkExecvpAsync_timeout";
-        return -errno;
-    }
-    if (!WIFEXITED(status)) {
-        LOG(ERROR) << "Process did not exit normally, status: " << status;
-        return -ECHILD;
-    }
-    if (WEXITSTATUS(status)) {
-        LOG(ERROR) << "Process exited with code: " << WEXITSTATUS(status);
-        return WEXITSTATUS(status);
-    }
-    return OK;
-}
-
-pid_t ForkExecvpAsync(const std::vector<std::string>& args, char* context) {
+pid_t ForkExecvpAsync(const std::vector<std::string>& args) {
     auto argv = ConvertToArgv(args);
 
     pid_t pid = fork();
@@ -808,12 +762,6 @@ pid_t ForkExecvpAsync(const std::vector<std::string>& args, char* context) {
         close(STDIN_FILENO);
         close(STDOUT_FILENO);
         close(STDERR_FILENO);
-        if (context) {
-            if (setexeccon(context)) {
-                LOG(ERROR) << "Failed to setexeccon in ForkExecvpAsync";
-                abort();
-            }
-        }
 
         execvp(argv[0], const_cast<char**>(argv.data()));
         PLOG(ERROR) << "exec in ForkExecvpAsync";
@@ -1494,17 +1442,6 @@ status_t AbortFuseConnections() {
     namespace fs = std::filesystem;
 
     for (const auto& itEntry : fs::directory_iterator("/sys/fs/fuse/connections")) {
-        std::string fsPath = itEntry.path().string() + "/filesystem";
-        std::string fs;
-
-        // Virtiofs is on top of fuse and there isn't any user space daemon.
-        // Android user space doesn't manage it.
-        if (android::base::ReadFileToString(fsPath, &fs, false) &&
-            android::base::Trim(fs) == "virtiofs") {
-            LOG(INFO) << "Ignore virtiofs connection entry " << itEntry.path().string();
-            continue;
-        }
-
         std::string abortPath = itEntry.path().string() + "/abort";
         LOG(DEBUG) << "Aborting fuse connection entry " << abortPath;
         bool ret = writeStringToFile("1", abortPath);
@@ -1758,55 +1695,5 @@ status_t PrepareAndroidDirs(const std::string& volumeRoot) {
 
     return OK;
 }
-
-namespace ab = android::base;
-
-static ab::unique_fd openDirFd(int parentFd, const char* name) {
-    return ab::unique_fd{::openat(parentFd, name, O_CLOEXEC | O_DIRECTORY | O_PATH | O_NOFOLLOW)};
-}
-
-static ab::unique_fd openAbsolutePathFd(std::string_view path) {
-    if (path.empty() || path[0] != '/') {
-        errno = EINVAL;
-        return {};
-    }
-    if (path == "/") {
-        return openDirFd(-1, "/");
-    }
-
-    // first component is special - it includes the leading slash
-    auto next = path.find('/', 1);
-    auto component = std::string(path.substr(0, next));
-    if (component == "..") {
-        errno = EINVAL;
-        return {};
-    }
-    auto fd = openDirFd(-1, component.c_str());
-    if (!fd.ok()) {
-        return fd;
-    }
-    path.remove_prefix(std::min(next + 1, path.size()));
-    while (next != path.npos && !path.empty()) {
-        next = path.find('/');
-        component.assign(path.substr(0, next));
-        fd = openDirFd(fd, component.c_str());
-        if (!fd.ok()) {
-            return fd;
-        }
-        path.remove_prefix(std::min(next + 1, path.size()));
-    }
-    return fd;
-}
-
-std::pair<android::base::unique_fd, std::string> OpenDirInProcfs(std::string_view path) {
-    auto fd = openAbsolutePathFd(path);
-    if (!fd.ok()) {
-        return {};
-    }
-
-    auto linkPath = std::string("/proc/self/fd/") += std::to_string(fd.get());
-    return {std::move(fd), std::move(linkPath)};
-}
-
 }  // namespace vold
 }  // namespace android
