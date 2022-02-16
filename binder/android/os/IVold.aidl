@@ -65,13 +65,8 @@ interface IVold {
     void destroyObb(@utf8InCpp String volId);
 
     void fstrim(int fstrimFlags, IVoldTaskListener listener);
-    void runIdleMaint(boolean needGC, IVoldTaskListener listener);
+    void runIdleMaint(IVoldTaskListener listener);
     void abortIdleMaint(IVoldTaskListener listener);
-    int getStorageLifeTime();
-    void setGCUrgentPace(int neededSegments, int minSegmentThreshold,
-                         float dirtyReclaimRate, float reclaimWeight);
-    void refreshLatestWrite();
-    int getWriteAmount();
 
     FileDescriptor mountAppFuse(int uid, int mountId);
     void unmountAppFuse(int uid, int mountId);
@@ -101,12 +96,15 @@ interface IVold {
     void createUserKey(int userId, int userSerial, boolean ephemeral);
     void destroyUserKey(int userId);
 
-    void addUserKeyAuth(int userId, int userSerial, @utf8InCpp String secret);
-    void clearUserKeyAuth(int userId, int userSerial, @utf8InCpp String secret);
+    void addUserKeyAuth(int userId, int userSerial, @utf8InCpp String token,
+                        @utf8InCpp String secret);
+    void clearUserKeyAuth(int userId, int userSerial, @utf8InCpp String token,
+                        @utf8InCpp String secret);
     void fixateNewestUserKeyAuth(int userId);
 
     int[] getUnlockedUsers();
-    void unlockUserKey(int userId, int userSerial, @utf8InCpp String secret);
+    void unlockUserKey(int userId, int userSerial, @utf8InCpp String token,
+                       @utf8InCpp String secret);
     void lockUserKey(int userId);
 
     void prepareUserStorage(@nullable @utf8InCpp String uuid, int userId, int userSerial,
@@ -161,8 +159,7 @@ interface IVold {
     const int FSTRIM_FLAG_DEEP_TRIM = 1;
 
     const int MOUNT_FLAG_PRIMARY = 1;
-    const int MOUNT_FLAG_VISIBLE_FOR_READ = 2;
-    const int MOUNT_FLAG_VISIBLE_FOR_WRITE = 4;
+    const int MOUNT_FLAG_VISIBLE = 2;
 
     const int PARTITION_TYPE_PUBLIC = 0;
     const int PARTITION_TYPE_PRIVATE = 1;
