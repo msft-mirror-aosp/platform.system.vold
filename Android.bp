@@ -41,6 +41,7 @@ cc_defaults {
         "libfec_rs",
         "libfs_avb",
         "libfs_mgr",
+        "libscrypt_static",
         "libsquashfs_utils",
         "libvold_binder",
     ],
@@ -107,7 +108,6 @@ cc_library_static {
     defaults: [
         "vold_default_flags",
         "vold_default_libs",
-        "keystore2_use_latest_aidl_ndk_shared",
     ],
 
     srcs: [
@@ -123,13 +123,14 @@ cc_library_static {
         "KeyBuffer.cpp",
         "KeyStorage.cpp",
         "KeyUtil.cpp",
-        "Keystore.cpp",
+        "Keymaster.cpp",
         "Loop.cpp",
         "MetadataCrypt.cpp",
         "MoveStorage.cpp",
         "NetlinkHandler.cpp",
         "NetlinkManager.cpp",
         "Process.cpp",
+        "ScryptParameters.cpp",
         "Utils.cpp",
         "VoldNativeService.cpp",
         "VoldNativeServiceValidation.cpp",
@@ -164,8 +165,9 @@ cc_library_static {
     },
     shared_libs: [
         "android.hardware.health.storage@1.0",
-        "android.hardware.health.storage-V1-ndk",
-        "android.security.maintenance-ndk",
+        "android.hardware.health.storage-V1-ndk_platform",
+        "android.system.keystore2-V1-ndk_platform",
+        "android.security.maintenance-ndk_platform",
         "libbinder_ndk",
         "libkeymint_support",
     ],
@@ -180,25 +182,26 @@ cc_binary {
     defaults: [
         "vold_default_flags",
         "vold_default_libs",
-        "keystore2_use_latest_aidl_ndk_shared",
     ],
 
     srcs: ["main.cpp"],
     static_libs: ["libvold"],
     init_rc: [
         "vold.rc",
+        "wait_for_keymaster.rc",
     ],
 
     required: [
         "mke2fs",
         "vold_prepare_subdirs",
-        "fuse_media.o",
+        "wait_for_keymaster",
     ],
 
     shared_libs: [
         "android.hardware.health.storage@1.0",
-        "android.hardware.health.storage-V1-ndk",
-        "android.security.maintenance-ndk",
+        "android.hardware.health.storage-V1-ndk_platform",
+        "android.system.keystore2-V1-ndk_platform",
+        "android.security.maintenance-ndk_platform",
         "libbinder_ndk",
         "libkeymint_support",
     ],
@@ -219,20 +222,39 @@ cc_binary {
     name: "vdc",
     defaults: ["vold_default_flags"],
 
-    srcs: [
-        "vdc.cpp",
-        "Utils.cpp",
-    ],
+    srcs: ["vdc.cpp"],
     shared_libs: [
         "libbase",
         "libbinder",
         "libcutils",
-        "liblogwrap",
-        "libselinux",
         "libutils",
     ],
     static_libs: [
         "libvold_binder",
+    ],
+    init_rc: ["vdc.rc"],
+}
+
+cc_binary {
+    name: "wait_for_keymaster",
+    defaults: ["vold_default_flags"],
+
+    srcs: [
+        "wait_for_keymaster.cpp",
+        "Keymaster.cpp",
+    ],
+    shared_libs: [
+        "libbase",
+        "libbinder",
+        "libbinder_ndk",
+
+        "android.system.keystore2-V1-ndk_platform",
+        "android.security.maintenance-ndk_platform",
+        "libhardware",
+        "libhardware_legacy",
+        "libhidlbase",
+        "libkeymint_support",
+        "libutils",
     ],
 }
 
