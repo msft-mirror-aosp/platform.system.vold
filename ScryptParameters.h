@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2015 The Android Open Source Project
+ * Copyright (C) 2016 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,19 +14,15 @@
  * limitations under the License.
  */
 
-#ifndef ANDROID_VOLD_IDLE_MAINT_H
-#define ANDROID_VOLD_IDLE_MAINT_H
+#ifndef ANDROID_VOLD_SCRYPT_PARAMETERS_H
+#define ANDROID_VOLD_SCRYPT_PARAMETERS_H
 
-#include "android/os/IVoldTaskListener.h"
+#include <stdbool.h>
+#include <sys/cdefs.h>
 
-namespace android {
-namespace vold {
+#define SCRYPT_PROP "ro.crypto.scrypt_params"
+#define SCRYPT_DEFAULTS "15:3:1"
 
-void Trim(const android::sp<android::os::IVoldTaskListener>& listener);
-int RunIdleMaint(const android::sp<android::os::IVoldTaskListener>& listener);
-int AbortIdleMaint(const android::sp<android::os::IVoldTaskListener>& listener);
-
-}  // namespace vold
-}  // namespace android
+bool parse_scrypt_parameters(const char* paramstr, int* Nf, int* rf, int* pf);
 
 #endif
