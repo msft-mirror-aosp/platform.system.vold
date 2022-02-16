@@ -97,7 +97,7 @@ status_t PublicVolume::doDestroy() {
 }
 
 status_t PublicVolume::doMount() {
-    bool isVisible = isVisibleForWrite();
+    bool isVisible = getMountFlags() & MountFlags::kVisible;
     readMetadata();
 
     if (mFsType == "vfat" && vfat::IsSupported()) {

@@ -36,9 +36,6 @@
 namespace android {
 namespace vold {
 
-using android::fscrypt::EncryptionOptions;
-using android::fscrypt::EncryptionPolicy;
-
 const KeyGeneration neverGen() {
     return KeyGeneration{0, false, false};
 }
@@ -54,10 +51,7 @@ static bool randomKey(size_t size, KeyBuffer* key) {
 }
 
 bool generateStorageKey(const KeyGeneration& gen, KeyBuffer* key) {
-    if (!gen.allow_gen) {
-        LOG(ERROR) << "Generating storage key not allowed";
-        return false;
-    }
+    if (!gen.allow_gen) return false;
     if (gen.use_hw_wrapped_key) {
         if (gen.keysize != FSCRYPT_MAX_KEY_SIZE) {
             LOG(ERROR) << "Cannot generate a wrapped key " << gen.keysize << " bytes long";
