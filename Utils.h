@@ -27,6 +27,7 @@
 
 #include <chrono>
 #include <string>
+#include <string_view>
 #include <vector>
 
 struct DIR;
@@ -36,12 +37,15 @@ namespace vold {
 
 static const char* kVoldAppDataIsolationEnabled = "persist.sys.vold_app_data_isolation_enabled";
 static const char* kExternalStorageSdcardfs = "external_storage.sdcardfs.enabled";
+static const char* kFuseBpfEnabled = "persist.sys.fuse.bpf.enable";
+
+static constexpr std::chrono::seconds kUntrustedFsckSleepTime(45);
 
 /* SELinux contexts used depending on the block device type */
-extern security_context_t sBlkidContext;
-extern security_context_t sBlkidUntrustedContext;
-extern security_context_t sFsckContext;
-extern security_context_t sFsckUntrustedContext;
+extern char* sBlkidContext;
+extern char* sBlkidUntrustedContext;
+extern char* sFsckContext;
+extern char* sFsckUntrustedContext;
 
 // TODO remove this with better solution, b/64143519
 extern bool sSleepOnUnmount;
@@ -104,10 +108,12 @@ status_t ReadMetadataUntrusted(const std::string& path, std::string* fsType, std
                                std::string* fsLabel);
 
 /* Returns either WEXITSTATUS() status, or a negative errno */
-status_t ForkExecvp(const std::vector<std::string>& args, std::vector<std::string>* output = nullptr,
-                    security_context_t context = nullptr);
+status_t ForkExecvp(const std::vector<std::string>& args,
+                    std::vector<std::string>* output = nullptr, char* context = nullptr);
+status_t ForkExecvpTimeout(const std::vector<std::string>& args, std::chrono::seconds timeout,
+                           char* context = nullptr);
 
-pid_t ForkExecvpAsync(const std::vector<std::string>& args);
+pid_t ForkExecvpAsync(const std::vector<std::string>& args, char* context = nullptr);
 
 /* Gets block device size in bytes */
 status_t GetBlockDevSize(int fd, uint64_t* size);
@@ -200,6 +206,18 @@ status_t UnmountUserFuse(userid_t userId, const std::string& absolute_lower_path
                          const std::string& relative_upper_path);
 
 status_t PrepareAndroidDirs(const std::string& volumeRoot);
+
+// Open a given directory as an FD, and return that and the corresponding procfs virtual
+// symlink path that can be used in any API that accepts a path string. Path stays valid until
+// the directory FD is closed.
+//
+// This may be useful when an API wants to restrict a path passed from an untrusted process,
+// and do it without any TOCTOU attacks possible (e.g. where an attacker replaces one of
+// the components with a symlink after the check passed). In that case opening a path through
+// this function guarantees that the target directory stays the same, and that it can be
+// referenced inside the current process via the virtual procfs symlink returned here.
+std::pair<android::base::unique_fd, std::string> OpenDirInProcfs(std::string_view path);
+
 }  // namespace vold
 }  // namespace android
 
