@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016 The Android Open Source Project
+ * Copyright (C) 2008 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,13 +14,18 @@
  * limitations under the License.
  */
 
-#ifndef _ENCRYPT_INPLACE_H
-#define _ENCRYPT_INPLACE_H
+#ifndef _DEVMAPPER_H
+#define _DEVMAPPER_H
 
-#include <stdint.h>
-#include <string>
+#include <linux/dm-ioctl.h>
+#include <unistd.h>
 
-bool encrypt_inplace(const std::string& crypto_blkdev, const std::string& real_blkdev,
-                     uint64_t nr_sec, bool set_progress_properties);
+class Devmapper {
+  public:
+    static int create(const char* name, const char* loopFile, const char* key,
+                      unsigned long numSectors, char* buffer, size_t len);
+    static int destroy(const char* name);
+    static int destroyAll();
+};
 
 #endif
