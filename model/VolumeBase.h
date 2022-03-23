@@ -63,14 +63,8 @@ class VolumeBase {
     enum MountFlags {
         /* Flag that volume is primary external storage */
         kPrimary = 1 << 0,
-        /*
-         * Flags indicating that volume is visible to normal apps.
-         * kVisibleForRead and kVisibleForWrite correspond to
-         * VolumeInfo.MOUNT_FLAG_VISIBLE_FOR_READ and
-         * VolumeInfo.MOUNT_FLAG_VISIBLE_FOR_WRITE, respectively.
-         */
-        kVisibleForRead = 1 << 1,
-        kVisibleForWrite = 1 << 2,
+        /* Flag that volume is visible to normal apps */
+        kVisible = 1 << 1,
     };
 
     enum class State {
@@ -109,9 +103,6 @@ class VolumeBase {
     std::shared_ptr<VolumeBase> findVolume(const std::string& id);
 
     bool isEmulated() { return mType == Type::kEmulated; }
-    bool isVisibleForRead() const { return (mMountFlags & MountFlags::kVisibleForRead) != 0; }
-    bool isVisibleForWrite() const { return (mMountFlags & MountFlags::kVisibleForWrite) != 0; }
-    bool isVisible() const { return isVisibleForRead() || isVisibleForWrite(); }
 
     status_t create();
     status_t destroy();

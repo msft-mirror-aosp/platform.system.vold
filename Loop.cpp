@@ -163,6 +163,8 @@ int Loop::destroyAll() {
             if (ioctl(fd.get(), LOOP_CLR_FD, 0) < 0) {
                 PLOG(WARNING) << "Failed to LOOP_CLR_FD " << path;
             }
+        } else {
+            LOG(DEBUG) << "Found unmanaged loop device at " << path << " named " << id;
         }
     }
 
