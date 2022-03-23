@@ -14,13 +14,15 @@
  * limitations under the License.
  */
 
-#ifndef _ENCRYPT_INPLACE_H
-#define _ENCRYPT_INPLACE_H
+#ifndef ANDROID_VOLD_SCRYPT_PARAMETERS_H
+#define ANDROID_VOLD_SCRYPT_PARAMETERS_H
 
-#include <stdint.h>
-#include <string>
+#include <stdbool.h>
+#include <sys/cdefs.h>
 
-bool encrypt_inplace(const std::string& crypto_blkdev, const std::string& real_blkdev,
-                     uint64_t nr_sec, bool set_progress_properties);
+#define SCRYPT_PROP "ro.crypto.scrypt_params"
+#define SCRYPT_DEFAULTS "15:3:1"
+
+bool parse_scrypt_parameters(const char* paramstr, int* Nf, int* rf, int* pf);
 
 #endif

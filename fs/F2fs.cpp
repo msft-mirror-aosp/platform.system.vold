@@ -97,7 +97,8 @@ status_t Format(const std::string& source) {
 
     const bool needs_casefold =
             android::base::GetBoolProperty("external_storage.casefold.enabled", false);
-    const bool needs_projid = true;
+    const bool needs_projid =
+            android::base::GetBoolProperty("external_storage.projid.enabled", false);
     if (needs_projid) {
         cmd.emplace_back("-O");
         cmd.emplace_back("project_quota,extra_attr");
