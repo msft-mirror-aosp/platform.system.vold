@@ -136,8 +136,8 @@ status_t DestroyDeviceNode(const std::string& path) {
 }
 
 // Sets a default ACL on the directory.
-status_t SetDefaultAcl(const std::string& path, mode_t mode, uid_t uid, gid_t gid,
-                       std::vector<gid_t> additionalGids) {
+int SetDefaultAcl(const std::string& path, mode_t mode, uid_t uid, gid_t gid,
+                  std::vector<gid_t> additionalGids) {
     if (IsSdcardfsUsed()) {
         // sdcardfs magically takes care of this
         return OK;
@@ -199,7 +199,7 @@ status_t SetDefaultAcl(const std::string& path, mode_t mode, uid_t uid, gid_t gi
 }
 
 int SetQuotaInherit(const std::string& path) {
-    unsigned int flags;
+    unsigned long flags;
 
     android::base::unique_fd fd(TEMP_FAILURE_RETRY(open(path.c_str(), O_RDONLY | O_CLOEXEC)));
     if (fd == -1) {
@@ -240,12 +240,7 @@ int SetQuotaProjectId(const std::string& path, long projectId) {
     }
 
     fsx.fsx_projid = projectId;
-    ret = ioctl(fd, FS_IOC_FSSETXATTR, &fsx);
-    if (ret == -1) {
-        PLOG(ERROR) << "Failed to set project id on " << path;
-        return ret;
-    }
-    return 0;
+    return ioctl(fd, FS_IOC_FSSETXATTR, &fsx);
 }
 
 int PrepareDirWithProjectId(const std::string& path, mode_t mode, uid_t uid, gid_t gid,
@@ -421,32 +416,7 @@ int PrepareAppDirFromRoot(const std::string& path, const std::string& root, int 
     return OK;
 }
 
-int SetAttrs(const std::string& path, unsigned int attrs) {
-    unsigned int flags;
-    android::base::unique_fd fd(
-            TEMP_FAILURE_RETRY(open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC)));
-
-    if (fd == -1) {
-        PLOG(ERROR) << "Failed to open " << path;
-        return -1;
-    }
-
-    if (ioctl(fd, FS_IOC_GETFLAGS, &flags)) {
-        PLOG(ERROR) << "Failed to get flags for " << path;
-        return -1;
-    }
-
-    if ((flags & attrs) == attrs) return 0;
-    flags |= attrs;
-    if (ioctl(fd, FS_IOC_SETFLAGS, &flags)) {
-        PLOG(ERROR) << "Failed to set flags for " << path << "(0x" << std::hex << attrs << ")";
-        return -1;
-    }
-    return 0;
-}
-
-status_t PrepareDir(const std::string& path, mode_t mode, uid_t uid, gid_t gid,
-                    unsigned int attrs) {
+status_t PrepareDir(const std::string& path, mode_t mode, uid_t uid, gid_t gid) {
     std::lock_guard<std::mutex> lock(kSecurityLock);
     const char* cpath = path.c_str();
 
@@ -463,9 +433,6 @@ status_t PrepareDir(const std::string& path, mode_t mode, uid_t uid, gid_t gid,
         setfscreatecon(nullptr);
         freecon(secontext);
     }
-
-    if (res) return -errno;
-    if (attrs) res = SetAttrs(path, attrs);
 
     if (res == 0) {
         return OK;
@@ -504,25 +471,25 @@ status_t ForceUnmount(const std::string& path) {
     return -errno;
 }
 
-status_t KillProcessesWithTmpfsMountPrefix(const std::string& path) {
-    if (KillProcessesWithTmpfsMounts(path, SIGINT) == 0) {
+status_t KillProcessesWithMountPrefix(const std::string& path) {
+    if (KillProcessesWithMounts(path, SIGINT) == 0) {
         return OK;
     }
     if (sSleepOnUnmount) sleep(5);
 
-    if (KillProcessesWithTmpfsMounts(path, SIGTERM) == 0) {
+    if (KillProcessesWithMounts(path, SIGTERM) == 0) {
         return OK;
     }
     if (sSleepOnUnmount) sleep(5);
 
-    if (KillProcessesWithTmpfsMounts(path, SIGKILL) == 0) {
+    if (KillProcessesWithMounts(path, SIGKILL) == 0) {
         return OK;
     }
     if (sSleepOnUnmount) sleep(5);
 
     // Send SIGKILL a second time to determine if we've
     // actually killed everyone mount
-    if (KillProcessesWithTmpfsMounts(path, SIGKILL) == 0) {
+    if (KillProcessesWithMounts(path, SIGKILL) == 0) {
         return OK;
     }
     PLOG(ERROR) << "Failed to kill processes using " << path;
@@ -530,25 +497,24 @@ status_t KillProcessesWithTmpfsMountPrefix(const std::string& path) {
 }
 
 status_t KillProcessesUsingPath(const std::string& path) {
-    if (KillProcessesWithOpenFiles(path, SIGINT, false /* killFuseDaemon */) == 0) {
+    if (KillProcessesWithOpenFiles(path, SIGINT) == 0) {
         return OK;
     }
     if (sSleepOnUnmount) sleep(5);
 
-    if (KillProcessesWithOpenFiles(path, SIGTERM, false /* killFuseDaemon */) == 0) {
+    if (KillProcessesWithOpenFiles(path, SIGTERM) == 0) {
         return OK;
     }
     if (sSleepOnUnmount) sleep(5);
 
-    if (KillProcessesWithOpenFiles(path, SIGKILL, false /* killFuseDaemon */) == 0) {
+    if (KillProcessesWithOpenFiles(path, SIGKILL) == 0) {
         return OK;
     }
     if (sSleepOnUnmount) sleep(5);
 
     // Send SIGKILL a second time to determine if we've
     // actually killed everyone with open files
-    // This time, we also kill the FUSE daemon if found
-    if (KillProcessesWithOpenFiles(path, SIGKILL, true /* killFuseDaemon */) == 0) {
+    if (KillProcessesWithOpenFiles(path, SIGKILL) == 0) {
         return OK;
     }
     PLOG(ERROR) << "Failed to kill processes using " << path;
@@ -962,7 +928,10 @@ int64_t calculate_dir_size(int dfd) {
             int subfd;
 
             /* always skip "." and ".." */
-            if (IsDotOrDotDot(*de)) continue;
+            if (name[0] == '.') {
+                if (name[1] == 0) continue;
+                if ((name[1] == '.') && (name[2] == 0)) continue;
+            }
 
             subfd = openat(dfd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
             if (subfd >= 0) {
@@ -1135,13 +1104,6 @@ dev_t GetDevice(const std::string& path) {
     }
 }
 
-// Returns true if |path1| names the same existing file or directory as |path2|.
-bool IsSameFile(const std::string& path1, const std::string& path2) {
-    struct stat stbuf1, stbuf2;
-    if (stat(path1.c_str(), &stbuf1) != 0 || stat(path2.c_str(), &stbuf2) != 0) return false;
-    return stbuf1.st_ino == stbuf2.st_ino && stbuf1.st_dev == stbuf2.st_dev;
-}
-
 status_t RestoreconRecursive(const std::string& path) {
     LOG(DEBUG) << "Starting restorecon of " << path;
 
@@ -1266,10 +1228,6 @@ status_t UnmountTree(const std::string& mountPoint) {
     return OK;
 }
 
-bool IsDotOrDotDot(const struct dirent& ent) {
-    return strcmp(ent.d_name, ".") == 0 || strcmp(ent.d_name, "..") == 0;
-}
-
 static status_t delete_dir_contents(DIR* dir) {
     // Shamelessly borrowed from android::installd
     int dfd = dirfd(dir);
@@ -1283,7 +1241,10 @@ static status_t delete_dir_contents(DIR* dir) {
         const char* name = de->d_name;
         if (de->d_type == DT_DIR) {
             /* always skip "." and ".." */
-            if (IsDotOrDotDot(*de)) continue;
+            if (name[0] == '.') {
+                if (name[1] == 0) continue;
+                if ((name[1] == '.') && (name[2] == 0)) continue;
+            }
 
             android::base::unique_fd subfd(
                 openat(dfd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
@@ -1355,10 +1316,6 @@ status_t WaitForFile(const char* filename, std::chrono::nanoseconds timeout) {
     return -1;
 }
 
-bool pathExists(const std::string& path) {
-    return access(path.c_str(), F_OK) == 0;
-}
-
 bool FsyncDirectory(const std::string& dirname) {
     android::base::unique_fd fd(TEMP_FAILURE_RETRY(open(dirname.c_str(), O_RDONLY | O_CLOEXEC)));
     if (fd == -1) {
@@ -1372,40 +1329,6 @@ bool FsyncDirectory(const std::string& dirname) {
         } else {
             PLOG(ERROR) << "Failed to fsync " << dirname;
             return false;
-        }
-    }
-    return true;
-}
-
-bool FsyncParentDirectory(const std::string& path) {
-    return FsyncDirectory(android::base::Dirname(path));
-}
-
-// Creates all parent directories of |path| that don't already exist.  Assigns
-// the specified |mode| to any new directories, and also fsync()s their parent
-// directories so that the new directories get written to disk right away.
-bool MkdirsSync(const std::string& path, mode_t mode) {
-    if (path[0] != '/') {
-        LOG(ERROR) << "MkdirsSync() needs an absolute path, but got " << path;
-        return false;
-    }
-    std::vector<std::string> components = android::base::Split(android::base::Dirname(path), "/");
-
-    std::string current_dir = "/";
-    for (const std::string& component : components) {
-        if (component.empty()) continue;
-
-        std::string parent_dir = current_dir;
-        if (current_dir != "/") current_dir += "/";
-        current_dir += component;
-
-        if (!pathExists(current_dir)) {
-            if (mkdir(current_dir.c_str(), mode) != 0) {
-                PLOG(ERROR) << "Failed to create " << current_dir;
-                return false;
-            }
-            if (!FsyncDirectory(parent_dir)) return false;
-            LOG(DEBUG) << "Created directory " << current_dir;
         }
     }
     return true;
@@ -1632,8 +1555,18 @@ status_t UnmountUserFuse(userid_t user_id, const std::string& absolute_lower_pat
     std::string pass_through_path(
             StringPrintf("/mnt/pass_through/%d/%s", user_id, relative_upper_path.c_str()));
 
+    // Best effort unmount pass_through path
+    sSleepOnUnmount = false;
+    LOG(INFO) << "Unmounting pass_through_path " << pass_through_path;
+    auto status = ForceUnmount(pass_through_path);
+    if (status != android::OK) {
+        LOG(ERROR) << "Failed to unmount " << pass_through_path;
+    }
+    rmdir(pass_through_path.c_str());
+
     LOG(INFO) << "Unmounting fuse path " << fuse_path;
     android::status_t result = ForceUnmount(fuse_path);
+    sSleepOnUnmount = true;
     if (result != android::OK) {
         // TODO(b/135341433): MNT_DETACH is needed for fuse because umount2 can fail with EBUSY.
         // Figure out why we get EBUSY and remove this special casing if possible.
@@ -1646,13 +1579,6 @@ status_t UnmountUserFuse(userid_t user_id, const std::string& absolute_lower_pat
         result = android::OK;
     }
     rmdir(fuse_path.c_str());
-
-    LOG(INFO) << "Unmounting pass_through_path " << pass_through_path;
-    auto status = ForceUnmount(pass_through_path);
-    if (status != android::OK) {
-        LOG(ERROR) << "Failed to unmount " << pass_through_path;
-    }
-    rmdir(pass_through_path.c_str());
 
     return result;
 }

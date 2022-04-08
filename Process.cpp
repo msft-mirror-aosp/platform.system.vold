@@ -39,7 +39,6 @@
 #include <android-base/strings.h>
 
 #include "Process.h"
-#include "Utils.h"
 
 using android::base::StringPrintf;
 
@@ -84,7 +83,7 @@ static bool checkSymlink(const std::string& path, const std::string& prefix) {
 }
 
 // TODO: Refactor the code with KillProcessesWithOpenFiles().
-int KillProcessesWithTmpfsMounts(const std::string& prefix, int signal) {
+int KillProcessesWithMounts(const std::string& prefix, int signal) {
     std::unordered_set<pid_t> pids;
 
     auto proc_d = std::unique_ptr<DIR, int (*)(DIR*)>(opendir("/proc"), closedir);
@@ -112,8 +111,7 @@ int KillProcessesWithTmpfsMounts(const std::string& prefix, int signal) {
         // Check if obb directory is mounted, and get all packages of mounted app data directory.
         mntent* mentry;
         while ((mentry = getmntent(fp.get())) != nullptr) {
-            if (mentry->mnt_fsname != nullptr && strncmp(mentry->mnt_fsname, "tmpfs", 5) == 0
-                    && android::base::StartsWith(mentry->mnt_dir, prefix)) {
+            if (android::base::StartsWith(mentry->mnt_dir, prefix)) {
                 pids.insert(pid);
                 break;
             }
@@ -129,7 +127,7 @@ int KillProcessesWithTmpfsMounts(const std::string& prefix, int signal) {
     return pids.size();
 }
 
-int KillProcessesWithOpenFiles(const std::string& prefix, int signal, bool killFuseDaemon) {
+int KillProcessesWithOpenFiles(const std::string& prefix, int signal) {
     std::unordered_set<pid_t> pids;
 
     auto proc_d = std::unique_ptr<DIR, int (*)(DIR*)>(opendir("/proc"), closedir);
@@ -166,24 +164,12 @@ int KillProcessesWithOpenFiles(const std::string& prefix, int signal, bool killF
         }
 
         if (found) {
-            if (!IsFuseDaemon(pid) || killFuseDaemon) {
-                pids.insert(pid);
-            } else {
-                LOG(WARNING) << "Found FUSE daemon with open file. Skipping...";
-            }
+            pids.insert(pid);
         }
     }
     if (signal != 0) {
         for (const auto& pid : pids) {
-            std::string comm;
-            android::base::ReadFileToString(StringPrintf("/proc/%d/comm", pid), &comm);
-            comm = android::base::Trim(comm);
-
-            std::string exe;
-            android::base::Readlink(StringPrintf("/proc/%d/exe", pid), &exe);
-
-            LOG(WARNING) << "Sending " << strsignal(signal) << " to pid " << pid << " (" << comm
-                         << ", " << exe << ")";
+            LOG(WARNING) << "Sending " << strsignal(signal) << " to " << pid;
             kill(pid, signal);
         }
     }

@@ -181,10 +181,7 @@ static status_t benchmarkInternal(const std::string& rootPath,
 void Benchmark(const std::string& path,
                const android::sp<android::os::IVoldTaskListener>& listener) {
     std::lock_guard<std::mutex> lock(kBenchmarkLock);
-    auto wl = android::wakelock::WakeLock::tryGet(kWakeLock);
-    if (!wl.has_value()) {
-        return;
-    }
+    android::wakelock::WakeLock wl{kWakeLock};
 
     PerformanceBoost boost;
     android::os::PersistableBundle extras;

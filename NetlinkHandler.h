@@ -25,6 +25,7 @@ class NetlinkHandler : public NetlinkListener {
     virtual ~NetlinkHandler();
 
     int start(void);
+    int stop(void);
 
   protected:
     virtual void onEvent(NetlinkEvent* evt);

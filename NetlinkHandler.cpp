@@ -33,6 +33,10 @@ int NetlinkHandler::start() {
     return this->startListener();
 }
 
+int NetlinkHandler::stop() {
+    return this->stopListener();
+}
+
 void NetlinkHandler::onEvent(NetlinkEvent* evt) {
     VolumeManager* vm = VolumeManager::Instance();
     const char* subsys = evt->getSubsystem();

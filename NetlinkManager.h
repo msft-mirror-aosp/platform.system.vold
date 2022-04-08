@@ -35,6 +35,7 @@ class NetlinkManager {
     virtual ~NetlinkManager();
 
     int start();
+    int stop();
 
     void setBroadcaster(SocketListener* sl) { mBroadcaster = sl; }
     SocketListener* getBroadcaster() { return mBroadcaster; }

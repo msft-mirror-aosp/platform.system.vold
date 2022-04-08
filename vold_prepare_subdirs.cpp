@@ -54,33 +54,20 @@ static bool valid_uuid(const std::string& s) {
     return s.size() < 40 && s.find_first_not_of("0123456789abcdefABCDEF-_") == std::string::npos;
 }
 
-static bool prepare_dir_for_user(struct selabel_handle* sehandle, mode_t mode, uid_t uid, gid_t gid,
-                                 const std::string& path, uid_t user_id) {
+static bool prepare_dir(struct selabel_handle* sehandle, mode_t mode, uid_t uid, gid_t gid,
+                        const std::string& path) {
     auto clearfscreatecon = android::base::make_scope_guard([] { setfscreatecon(nullptr); });
     auto secontext = std::unique_ptr<char, void (*)(char*)>(nullptr, freecon);
-    if (sehandle) {
-        char* tmp_secontext;
-
-        if (selabel_lookup(sehandle, &tmp_secontext, path.c_str(), S_IFDIR) == 0) {
-            secontext.reset(tmp_secontext);
-
-            if (user_id != (uid_t)-1) {
-                if (selinux_android_context_with_level(secontext.get(), &tmp_secontext, user_id,
-                                                       (uid_t)-1) != 0) {
-                    PLOG(ERROR) << "Unable to create context with level for: " << path;
-                    return false;
-                }
-                secontext.reset(tmp_secontext);  // Free the context
-            }
-        }
+    char* tmp_secontext;
+    if (sehandle && selabel_lookup(sehandle, &tmp_secontext, path.c_str(), S_IFDIR) == 0) {
+        secontext.reset(tmp_secontext);
     }
-
     LOG(DEBUG) << "Setting up mode " << std::oct << mode << std::dec << " uid " << uid << " gid "
                << gid << " context " << (secontext ? secontext.get() : "null")
                << " on path: " << path;
     if (secontext) {
         if (setfscreatecon(secontext.get()) != 0) {
-            PLOG(ERROR) << "Unable to setfscreatecon for: " << path;
+            PLOG(ERROR) << "Unable to read setfscreatecon for: " << path;
             return false;
         }
     }
@@ -104,11 +91,6 @@ static bool prepare_dir_for_user(struct selabel_handle* sehandle, mode_t mode, u
         }
     }
     return true;
-}
-
-static bool prepare_dir(struct selabel_handle* sehandle, mode_t mode, uid_t uid, gid_t gid,
-                        const std::string& path) {
-    return prepare_dir_for_user(sehandle, mode, uid, gid, path, (uid_t)-1);
 }
 
 static bool rmrf_contents(const std::string& path) {
@@ -166,13 +148,8 @@ static bool prepare_apex_subdirs(struct selabel_handle* sehandle, const std::str
 static bool prepare_subdirs(const std::string& volume_uuid, int user_id, int flags) {
     struct selabel_handle* sehandle = selinux_android_file_context_handle();
 
-    if (flags & android::os::IVold::STORAGE_FLAG_DE) {
-        auto user_de_path = android::vold::BuildDataUserDePath(volume_uuid, user_id);
-        if (!prepare_dir_for_user(sehandle, 0771, AID_SYSTEM, AID_SYSTEM, user_de_path, user_id)) {
-            return false;
-        }
-
-        if (volume_uuid.empty()) {
+    if (volume_uuid.empty()) {
+        if (flags & android::os::IVold::STORAGE_FLAG_DE) {
             auto misc_de_path = android::vold::BuildDataMiscDePath(user_id);
             if (!prepare_dir(sehandle, 0700, 0, 0, misc_de_path + "/vold")) return false;
             if (!prepare_dir(sehandle, 0700, 0, 0, misc_de_path + "/storaged")) return false;
@@ -180,12 +157,6 @@ static bool prepare_subdirs(const std::string& volume_uuid, int user_id, int fla
             // TODO: Return false if this returns false once sure this should succeed.
             prepare_dir(sehandle, 0700, 0, 0, misc_de_path + "/apexrollback");
             prepare_apex_subdirs(sehandle, misc_de_path);
-
-            auto profiles_de_path = android::vold::BuildDataProfilesDePath(user_id);
-            if (!prepare_dir_for_user(sehandle, 0771, AID_SYSTEM, AID_SYSTEM, profiles_de_path,
-                                      user_id)) {
-                return false;
-            }
 
             auto vendor_de_path = android::vold::BuildDataVendorDePath(user_id);
             if (!prepare_dir(sehandle, 0700, AID_SYSTEM, AID_SYSTEM, vendor_de_path + "/fpdata")) {
@@ -196,19 +167,11 @@ static bool prepare_subdirs(const std::string& volume_uuid, int user_id, int fla
                 return false;
             }
         }
-    }
-    if (flags & android::os::IVold::STORAGE_FLAG_CE) {
-        auto user_ce_path = android::vold::BuildDataUserCePath(volume_uuid, user_id);
-        if (!prepare_dir_for_user(sehandle, 0771, AID_SYSTEM, AID_SYSTEM, user_ce_path, user_id)) {
-            return false;
-        }
-
-        if (volume_uuid.empty()) {
+        if (flags & android::os::IVold::STORAGE_FLAG_CE) {
             auto misc_ce_path = android::vold::BuildDataMiscCePath(user_id);
             if (!prepare_dir(sehandle, 0700, 0, 0, misc_ce_path + "/vold")) return false;
             if (!prepare_dir(sehandle, 0700, 0, 0, misc_ce_path + "/storaged")) return false;
             if (!prepare_dir(sehandle, 0700, 0, 0, misc_ce_path + "/rollback")) return false;
-
             // TODO: Return false if this returns false once sure this should succeed.
             prepare_dir(sehandle, 0700, 0, 0, misc_ce_path + "/apexrollback");
             prepare_apex_subdirs(sehandle, misc_ce_path);
