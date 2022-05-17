@@ -12,8 +12,6 @@ cc_defaults {
         "-Wno-unused-parameter",
     ],
 
-    clang: true,
-
     tidy: true,
     tidy_checks: [
         "-*",
@@ -21,8 +19,9 @@ cc_defaults {
         "clang-analyzer-security*",
         "android-*",
     ],
-    tidy_flags: [
-        "-warnings-as-errors=clang-analyzer-security*,cert-*",
+    tidy_checks_as_errors: [
+        "clang-analyzer-security*",
+        "cert-*",
     ],
 }
 
@@ -168,7 +167,7 @@ cc_library_static {
     ],
     whole_static_libs: [
         "com.android.sysprop.apex",
-        "libc++fs"
+        "libc++fs",
     ],
 }
 
@@ -209,7 +208,7 @@ cc_binary {
                 "libarcvolume",
             ],
         },
-	},
+    },
 }
 
 cc_binary {
@@ -248,7 +247,10 @@ cc_binary {
     name: "vold_prepare_subdirs",
     defaults: ["vold_default_flags"],
 
-    srcs: ["vold_prepare_subdirs.cpp", "Utils.cpp"],
+    srcs: [
+        "vold_prepare_subdirs.cpp",
+        "Utils.cpp",
+    ],
     shared_libs: [
         "libbase",
         "libcutils",
