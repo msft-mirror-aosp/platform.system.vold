@@ -55,6 +55,7 @@
 #include <fscrypt/fscrypt.h>
 
 #include "AppFuseUtil.h"
+#include "Devmapper.h"
 #include "FsCrypt.h"
 #include "Loop.h"
 #include "NetlinkManager.h"
@@ -93,6 +94,7 @@ using android::vold::UnmountTree;
 using android::vold::VoldNativeService;
 using android::vold::VolumeBase;
 
+static const char* kPathUserMount = "/mnt/user";
 static const char* kPathVirtualDisk = "/data/misc/vold/virtual_disk";
 
 static const char* kPropVirtualDisk = "persist.sys.virtual_disk";
@@ -177,6 +179,7 @@ int VolumeManager::start() {
     // directories that we own, in case we crashed.
     unmountAll();
 
+    Devmapper::destroyAll();
     Loop::destroyAll();
 
     // Assume that we always have an emulated volume on internal
@@ -236,7 +239,7 @@ void VolumeManager::handleBlockEvent(NetlinkEvent* evt) {
             break;
         }
         case NetlinkEvent::Action::kChange: {
-            LOG(VERBOSE) << "Disk at " << major << ":" << minor << " changed";
+            LOG(DEBUG) << "Disk at " << major << ":" << minor << " changed";
             handleDiskChanged(device);
             break;
         }
@@ -896,28 +899,13 @@ int VolumeManager::reset() {
     }
     mInternalEmulatedVolumes.clear();
 
-    // Destroy and recreate all disks except that StubVolume disks are just
-    // destroyed and removed from both mDisks and mPendingDisks.
-    // StubVolumes are managed from outside Android (e.g. from Chrome OS) and
-    // their disk recreation on reset events should be handled from outside by
-    // calling createStubVolume() again.
     for (const auto& disk : mDisks) {
         disk->destroy();
-        if (!disk->isStub()) {
-            disk->create();
-        }
+        disk->create();
     }
-    const auto isStub = [](const auto& disk) { return disk->isStub(); };
-    mDisks.remove_if(isStub);
-    mPendingDisks.remove_if(isStub);
-
     updateVirtualDisk();
     mAddedUsers.clear();
     mStartedUsers.clear();
-
-    // Abort all FUSE connections to avoid deadlocks if the FUSE daemon was killed
-    // with FUSE fds open.
-    abortFuse();
     return 0;
 }
 
@@ -1014,8 +1002,8 @@ int VolumeManager::setupAppDir(const std::string& path, int32_t appUid, bool fix
             // The volume must be mounted
             return false;
         }
-        if (!vol.isVisibleForWrite()) {
-            // App dirs should only be created for writable volumes.
+        if ((vol.getMountFlags() & VolumeBase::MountFlags::kVisible) == 0) {
+            // and visible
             return false;
         }
         if (vol.getInternalPath().empty()) {
@@ -1076,8 +1064,8 @@ int VolumeManager::fixupAppDir(const std::string& path, int32_t appUid) {
     return setupAppDir(path, appUid, true /* fixupExistingOnly */);
 }
 
-int VolumeManager::createObb(const std::string& sourcePath, int32_t ownerGid,
-                             std::string* outVolId) {
+int VolumeManager::createObb(const std::string& sourcePath, const std::string& sourceKey,
+                             int32_t ownerGid, std::string* outVolId) {
     int id = mNextObbId++;
 
     std::string lowerSourcePath;
@@ -1089,8 +1077,8 @@ int VolumeManager::createObb(const std::string& sourcePath, int32_t ownerGid,
                 // The volume must be mounted
                 return false;
             }
-            if (!vol.isVisibleForWrite()) {
-                // Obb volume should only be created for writable volumes.
+            if ((vol.getMountFlags() & VolumeBase::MountFlags::kVisible) == 0) {
+                // and visible
                 return false;
             }
             if (vol.getInternalPath().empty()) {
@@ -1115,7 +1103,7 @@ int VolumeManager::createObb(const std::string& sourcePath, int32_t ownerGid,
     }
 
     auto vol = std::shared_ptr<android::vold::VolumeBase>(
-            new android::vold::ObbVolume(id, lowerSourcePath, ownerGid));
+            new android::vold::ObbVolume(id, lowerSourcePath, sourceKey, ownerGid));
     vol->create();
 
     mObbVolumes.push_back(vol);
