@@ -123,10 +123,14 @@ static void hashWithPrefix(char const* prefix, const std::string& tohash, std::s
     SHA512_Final(reinterpret_cast<uint8_t*>(&(*res)[0]), &c);
 }
 
-// Generates a keymaster key, using rollback resistance if supported.
-static bool generateKeymasterKey(Keymaster& keymaster,
-                                 const km::AuthorizationSetBuilder& paramBuilder,
-                                 std::string* key) {
+static bool generateKeyStorageKey(Keymaster& keymaster, const std::string& appId,
+                                  std::string* key) {
+    auto paramBuilder = km::AuthorizationSetBuilder()
+                                .AesEncryptionKey(AES_KEY_BYTES * 8)
+                                .GcmModeMinMacLen(GCM_MAC_BYTES * 8)
+                                .Authorization(km::TAG_APPLICATION_ID, appId)
+                                .Authorization(km::TAG_NO_AUTH_REQUIRED);
+    LOG(DEBUG) << "Generating \"key storage\" key";
     auto paramsWithRollback = paramBuilder;
     paramsWithRollback.Authorization(km::TAG_ROLLBACK_RESISTANCE);
 
@@ -139,24 +143,13 @@ static bool generateKeymasterKey(Keymaster& keymaster,
     return true;
 }
 
-static bool generateKeyStorageKey(Keymaster& keymaster, const std::string& appId,
-                                  std::string* key) {
-    auto paramBuilder = km::AuthorizationSetBuilder()
-                                .AesEncryptionKey(AES_KEY_BYTES * 8)
-                                .GcmModeMinMacLen(GCM_MAC_BYTES * 8)
-                                .Authorization(km::TAG_APPLICATION_ID, appId)
-                                .Authorization(km::TAG_NO_AUTH_REQUIRED);
-    LOG(DEBUG) << "Generating \"key storage\" key";
-    return generateKeymasterKey(keymaster, paramBuilder, key);
-}
-
 bool generateWrappedStorageKey(KeyBuffer* key) {
     Keymaster keymaster;
     if (!keymaster) return false;
     std::string key_temp;
     auto paramBuilder = km::AuthorizationSetBuilder().AesEncryptionKey(AES_KEY_BYTES * 8);
     paramBuilder.Authorization(km::TAG_STORAGE_KEY);
-    if (!generateKeymasterKey(keymaster, paramBuilder, &key_temp)) return false;
+    if (!keymaster.generateKey(paramBuilder, &key_temp)) return false;
     *key = KeyBuffer(key_temp.size());
     memcpy(reinterpret_cast<void*>(key->data()), key_temp.c_str(), key->size());
     return true;
