@@ -86,8 +86,7 @@ static const int DIRTY_SEGMENTS_THRESHOLD = 100;
 static const int GC_TIMEOUT_SEC = 420;
 static const int DEVGC_TIMEOUT_SEC = 120;
 static const int KBYTES_IN_SEGMENT = 2048;
-static const int MIN_GC_URGENT_SLEEP_TIME = 500;
-static const int ONE_HOUR_IN_MS = 3600000;
+static const int ONE_MINUTE_IN_MS = 60000;
 static const int GC_NORMAL_MODE = 0;
 static const int GC_URGENT_MID_MODE = 3;
 
@@ -391,28 +390,6 @@ static void runDevGcOnHal(Service service, GcCallbackImpl cb, GetDescription get
 }
 
 static void runDevGc(void) {
-    auto aidl_service_name = AStorage::descriptor + "/default"s;
-    if (AServiceManager_isDeclared(aidl_service_name.c_str())) {
-        ndk::SpAIBinder binder(AServiceManager_waitForService(aidl_service_name.c_str()));
-        if (binder.get() != nullptr) {
-            std::shared_ptr<AStorage> aidl_service = AStorage::fromBinder(binder);
-            if (aidl_service != nullptr) {
-                runDevGcOnHal<IDL::AIDL>(aidl_service, ndk::SharedRefBase::make<AGcCallbackImpl>(),
-                                         &ndk::ScopedAStatus::getDescription);
-                return;
-            }
-        }
-        LOG(WARNING) << "Device declares " << aidl_service_name
-                     << " but it is not running, skip dev GC on AIDL HAL";
-        return;
-    }
-    auto hidl_service = HStorage::getService();
-    if (hidl_service != nullptr) {
-        runDevGcOnHal<IDL::HIDL>(hidl_service, sp<HGcCallbackImpl>(new HGcCallbackImpl()),
-                                 &Return<void>::description);
-        return;
-    }
-    // fallback to legacy code path
     runDevGcFstab();
 }
 
@@ -450,16 +427,16 @@ int RunIdleMaint(bool needGC, const android::sp<android::os::IVoldTaskListener>&
         stopGc(paths);
     }
 
+    if (!gc_aborted) {
+        Trim(nullptr);
+        runDevGc();
+    }
+
     lk.lock();
     idle_maint_stat = IdleMaintStats::kStopped;
     lk.unlock();
 
     cv_stop.notify_one();
-
-    if (!gc_aborted) {
-        Trim(nullptr);
-        runDevGc();
-    }
 
     if (listener) {
         android::os::PersistableBundle extras;
@@ -531,9 +508,11 @@ int32_t GetStorageLifeTime() {
 }
 
 void SetGCUrgentPace(int32_t neededSegments, int32_t minSegmentThreshold, float dirtyReclaimRate,
-                     float reclaimWeight) {
+                     float reclaimWeight, int32_t gcPeriod, int32_t minGCSleepTime,
+                     int32_t targetDirtyRatio) {
     std::list<std::string> paths;
-    bool needGC = true;
+    bool needGC = false;
+    int32_t sleepTime;
 
     addFromFstab(&paths, PathTypes::kBlkDevice, true);
     if (paths.empty()) {
@@ -546,7 +525,9 @@ void SetGCUrgentPace(int32_t neededSegments, int32_t minSegmentThreshold, float 
     std::string dirtySegmentsPath = f2fsSysfsPath + "/dirty_segments";
     std::string gcSleepTimePath = f2fsSysfsPath + "/gc_urgent_sleep_time";
     std::string gcUrgentModePath = f2fsSysfsPath + "/gc_urgent";
-    std::string freeSegmentsStr, dirtySegmentsStr;
+    std::string ovpSegmentsPath = f2fsSysfsPath + "/ovp_segments";
+    std::string reservedBlocksPath = f2fsSysfsPath + "/reserved_blocks";
+    std::string freeSegmentsStr, dirtySegmentsStr, ovpSegmentsStr, reservedBlocksStr;
 
     if (!ReadFileToString(freeSegmentsPath, &freeSegmentsStr)) {
         PLOG(WARNING) << "Reading failed in " << freeSegmentsPath;
@@ -558,18 +539,53 @@ void SetGCUrgentPace(int32_t neededSegments, int32_t minSegmentThreshold, float 
         return;
     }
 
+    if (!ReadFileToString(ovpSegmentsPath, &ovpSegmentsStr)) {
+            PLOG(WARNING) << "Reading failed in " << ovpSegmentsPath;
+            return;
+        }
+
+    if (!ReadFileToString(reservedBlocksPath, &reservedBlocksStr)) {
+            PLOG(WARNING) << "Reading failed in " << reservedBlocksPath;
+            return;
+        }
+
     int32_t freeSegments = std::stoi(freeSegmentsStr);
     int32_t dirtySegments = std::stoi(dirtySegmentsStr);
+    int32_t reservedBlocks = std::stoi(ovpSegmentsStr) + std::stoi(reservedBlocksStr);
 
-    neededSegments *= reclaimWeight;
-    if (freeSegments >= neededSegments) {
-        LOG(INFO) << "Enough free segments: " << freeSegments
-                   << ", needed segments: " << neededSegments;
-        needGC = false;
-    } else if (freeSegments + dirtySegments < minSegmentThreshold) {
+    freeSegments = freeSegments > reservedBlocks ? freeSegments - reservedBlocks : 0;
+    int32_t totalSegments = freeSegments + dirtySegments;
+    int32_t finalTargetSegments = 0;
+
+    if (totalSegments < minSegmentThreshold) {
         LOG(INFO) << "The sum of free segments: " << freeSegments
-                   << ", dirty segments: " << dirtySegments << " is under " << minSegmentThreshold;
-        needGC = false;
+                  << ", dirty segments: " << dirtySegments << " is under " << minSegmentThreshold;
+    } else {
+        int32_t dirtyRatio = dirtySegments * 100 / totalSegments;
+        int32_t neededForTargetRatio =
+                (dirtyRatio > targetDirtyRatio)
+                        ? totalSegments * (dirtyRatio - targetDirtyRatio) / 100
+                        : 0;
+        neededSegments *= reclaimWeight;
+        neededSegments = (neededSegments > freeSegments) ? neededSegments - freeSegments : 0;
+
+        finalTargetSegments = std::max(neededSegments, neededForTargetRatio);
+        if (finalTargetSegments == 0) {
+            LOG(INFO) << "Enough free segments: " << freeSegments;
+        } else {
+            finalTargetSegments =
+                    std::min(finalTargetSegments, (int32_t)(dirtySegments * dirtyReclaimRate));
+            if (finalTargetSegments == 0) {
+                LOG(INFO) << "Low dirty segments: " << dirtySegments;
+            } else if (neededSegments >= neededForTargetRatio) {
+                LOG(INFO) << "Trigger GC, because of needed segments exceeding free segments";
+                needGC = true;
+            } else {
+                LOG(INFO) << "Trigger GC for target dirty ratio diff of: "
+                          << dirtyRatio - targetDirtyRatio;
+                needGC = true;
+            }
+        }
     }
 
     if (!needGC) {
@@ -579,18 +595,11 @@ void SetGCUrgentPace(int32_t neededSegments, int32_t minSegmentThreshold, float 
         return;
     }
 
-    int32_t sleepTime;
-
-    neededSegments -= freeSegments;
-    neededSegments = std::min(neededSegments, (int32_t)(dirtySegments * dirtyReclaimRate));
-    if (neededSegments == 0) {
-        sleepTime = MIN_GC_URGENT_SLEEP_TIME;
-    } else {
-        sleepTime = ONE_HOUR_IN_MS / neededSegments;
-        if (sleepTime < MIN_GC_URGENT_SLEEP_TIME) {
-            sleepTime = MIN_GC_URGENT_SLEEP_TIME;
-        }
+    sleepTime = gcPeriod * ONE_MINUTE_IN_MS / finalTargetSegments;
+    if (sleepTime < minGCSleepTime) {
+        sleepTime = minGCSleepTime;
     }
+
     if (!WriteStringToFile(std::to_string(sleepTime), gcSleepTimePath)) {
         PLOG(WARNING) << "Writing failed in " << gcSleepTimePath;
         return;
@@ -602,8 +611,8 @@ void SetGCUrgentPace(int32_t neededSegments, int32_t minSegmentThreshold, float 
     }
 
     LOG(INFO) << "Successfully set gc urgent mode: "
-               << "free segments: " << freeSegments << ", reclaim target: " << neededSegments
-               << ", sleep time: " << sleepTime;
+              << "free segments: " << freeSegments << ", reclaim target: " << finalTargetSegments
+              << ", sleep time: " << sleepTime;
 }
 
 static int32_t getLifeTimeWrite() {
