@@ -1127,42 +1127,28 @@ static void convert_key_to_hex_ascii(const unsigned char* master_key, unsigned i
     master_key_ascii[a] = '\0';
 }
 
-/*
- * If the ro.crypto.fde_sector_size system property is set, append the
- * parameters to make dm-crypt use the specified crypto sector size and round
- * the crypto device size down to a crypto sector boundary.
- */
-static int add_sector_size_param(DmTargetCrypt* target, struct crypt_mnt_ftr* ftr) {
+static int create_crypto_blk_dev(struct crypt_mnt_ftr* crypt_ftr, const unsigned char* master_key,
+                                 const char* real_blk_name, std::string* crypto_blk_name,
+                                 const char* name, uint32_t flags) {
     constexpr char DM_CRYPT_SECTOR_SIZE[] = "ro.crypto.fde_sector_size";
     char value[PROPERTY_VALUE_MAX];
+    unsigned int sector_size = 0;
 
     if (property_get(DM_CRYPT_SECTOR_SIZE, value, "") > 0) {
-        unsigned int sector_size;
-
         if (!ParseUint(value, &sector_size) || sector_size < 512 || sector_size > 4096 ||
             (sector_size & (sector_size - 1)) != 0) {
             SLOGE("Invalid value for %s: %s.  Must be >= 512, <= 4096, and a power of 2\n",
                   DM_CRYPT_SECTOR_SIZE, value);
             return -1;
         }
-
-        target->SetSectorSize(sector_size);
-
-        // With this option, IVs will match the sector numbering, instead
-        // of being hard-coded to being based on 512-byte sectors.
-        target->SetIvLargeSectors();
-
-        // Round the crypto device size down to a crypto sector boundary.
-        ftr->fs_size &= ~((sector_size / 512) - 1);
     }
-    return 0;
-}
 
-static int create_crypto_blk_dev(struct crypt_mnt_ftr* crypt_ftr, const unsigned char* master_key,
-                                 const char* real_blk_name, std::string* crypto_blk_name,
-                                 const char* name, uint32_t flags) {
+    // Round the crypto device size down to a crypto sector boundary.
+    if (sector_size > 0) {
+        crypt_ftr->fs_size &= ~((sector_size / 512) - 1);
+    }
+
     auto& dm = DeviceMapper::Instance();
-
     // We need two ASCII characters to represent each byte, and need space for
     // the '\0' terminator.
     char master_key_ascii[MAX_KEY_LEN * 2 + 1];
@@ -1176,9 +1162,13 @@ static int create_crypto_blk_dev(struct crypt_mnt_ftr* crypt_ftr, const unsigned
     if (flags & CREATE_CRYPTO_BLK_DEV_FLAGS_ALLOW_ENCRYPT_OVERRIDE) {
         target->AllowEncryptOverride();
     }
-    if (add_sector_size_param(target.get(), crypt_ftr)) {
-        SLOGE("Error processing dm-crypt sector size param\n");
-        return -1;
+
+    // Append the parameters to make dm-crypt use the specified crypto sector size.
+    if (sector_size > 0) {
+        target->SetSectorSize(sector_size);
+        // With this option, IVs will match the sector numbering, instead
+        // of being hard-coded to being based on 512-byte sectors.
+        target->SetIvLargeSectors();
     }
 
     DmTable table;
