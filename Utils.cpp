@@ -766,7 +766,7 @@ status_t ForkExecvpTimeout(const std::vector<std::string>& args, std::chrono::se
         }
         pid_t timer_pid = fork();
         if (timer_pid == 0) {
-            sleep(timeout.count());
+            std::this_thread::sleep_for(timeout);
             _exit(ETIMEDOUT);
         }
         if (timer_pid == -1) {
@@ -1448,7 +1448,10 @@ bool writeStringToFile(const std::string& payload, const std::string& filename) 
 status_t AbortFuseConnections() {
     namespace fs = std::filesystem;
 
-    for (const auto& itEntry : fs::directory_iterator("/sys/fs/fuse/connections")) {
+    static constexpr const char* kFuseConnections = "/sys/fs/fuse/connections";
+
+    std::error_code ec;
+    for (const auto& itEntry : fs::directory_iterator(kFuseConnections, ec)) {
         std::string fsPath = itEntry.path().string() + "/filesystem";
         std::string fs;
 
@@ -1466,6 +1469,11 @@ status_t AbortFuseConnections() {
         if (!ret) {
             LOG(WARNING) << "Failed to write to " << abortPath;
         }
+    }
+
+    if (ec) {
+        LOG(WARNING) << "Failed to iterate through " << kFuseConnections << ": "  << ec.message();
+        return -ec.value();
     }
 
     return OK;
@@ -1761,6 +1769,26 @@ std::pair<android::base::unique_fd, std::string> OpenDirInProcfs(std::string_vie
 
     auto linkPath = std::string("/proc/self/fd/") += std::to_string(fd.get());
     return {std::move(fd), std::move(linkPath)};
+}
+
+bool IsFuseBpfEnabled() {
+    // TODO Once kernel supports flag, trigger off kernel flag unless
+    //      ro.fuse.bpf.enabled is explicitly set to false
+    bool enabled;
+    if (base::GetProperty("ro.fuse.bpf.is_running", "") != "")
+        enabled = base::GetBoolProperty("ro.fuse.bpf.is_running", false);
+    else if (base::GetProperty("persist.sys.fuse.bpf.override", "") != "")
+        enabled = base::GetBoolProperty("persist.sys.fuse.bpf.override", false);
+    else
+        enabled = base::GetBoolProperty("ro.fuse.bpf.enabled", false);
+
+    if (enabled) {
+        base::SetProperty("ro.fuse.bpf.is_running", "true");
+        return true;
+    } else {
+        base::SetProperty("ro.fuse.bpf.is_running", "false");
+        return false;
+    }
 }
 
 }  // namespace vold
