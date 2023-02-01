@@ -16,6 +16,8 @@
 
 #define LOG_TAG "Checkpoint"
 #include "Checkpoint.h"
+#include "FsCrypt.h"
+#include "KeyStorage.h"
 #include "VoldUtil.h"
 #include "VolumeManager.h"
 
@@ -26,12 +28,12 @@
 #include <thread>
 #include <vector>
 
+#include <BootControlClient.h>
 #include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/parseint.h>
 #include <android-base/properties.h>
 #include <android-base/unique_fd.h>
-#include <android/hardware/boot/1.0/IBootControl.h>
 #include <cutils/android_reboot.h>
 #include <fcntl.h>
 #include <fs_mgr.h>
@@ -48,11 +50,7 @@ using android::base::SetProperty;
 using android::binder::Status;
 using android::fs_mgr::Fstab;
 using android::fs_mgr::ReadFstabFromFile;
-using android::hardware::hidl_string;
-using android::hardware::boot::V1_0::BoolResult;
-using android::hardware::boot::V1_0::CommandResult;
-using android::hardware::boot::V1_0::IBootControl;
-using android::hardware::boot::V1_0::Slot;
+using android::hal::BootControlClient;
 
 namespace android {
 namespace vold {
@@ -80,6 +78,18 @@ bool setBowState(std::string const& block_device, std::string const& state) {
     }
 
     return true;
+}
+
+// Do any work that was deferred until the userdata filesystem checkpoint was
+// committed.  This work involves the deletion of resources that aren't covered
+// by the userdata filesystem checkpoint, e.g. Keystore keys.
+void DoCheckpointCommittedWork() {
+    // Take the crypt lock to provide synchronization with the Binder calls that
+    // operate on key directories.
+    std::lock_guard<std::mutex> lock(VolumeManager::Instance()->getCryptLock());
+
+    DeferredCommitKeystoreKeys();
+    fscrypt_deferred_fixate_ce_keys();
 }
 
 }  // namespace
@@ -128,11 +138,10 @@ Status cp_startCheckpoint(int retry) {
     if (retry < -1) return error(EINVAL, "Retry count must be more than -1");
     std::string content = std::to_string(retry + 1);
     if (retry == -1) {
-        sp<IBootControl> module = IBootControl::getService();
+        auto module = BootControlClient::WaitForService();
         if (module) {
-            std::string suffix;
-            auto cb = [&suffix](hidl_string s) { suffix = s; };
-            if (module->getSuffix(module->getCurrentSlot(), cb).isOk()) content += " " + suffix;
+            std::string suffix = module->GetSuffix(module->GetCurrentSlot());
+            if (!suffix.empty()) content += " " + suffix;
         }
     }
     if (!android::base::WriteStringToFile(content, kMetadataCPFile))
@@ -143,6 +152,7 @@ Status cp_startCheckpoint(int retry) {
 namespace {
 
 volatile bool isCheckpointing = false;
+volatile bool isBow = true;
 
 volatile bool needsCheckpointWasCalled = false;
 
@@ -162,10 +172,9 @@ Status cp_commitChanges() {
             << "NOT COMMITTING CHECKPOINT BECAUSE persist.vold.dont_commit_checkpoint IS 1";
         return Status::ok();
     }
-    sp<IBootControl> module = IBootControl::getService();
+    auto module = BootControlClient::WaitForService();
     if (module) {
-        CommandResult cr;
-        module->markBootSuccessful([&cr](CommandResult result) { cr = result; });
+        auto cr = module->MarkBootSuccessful();
         if (!cr.success)
             return error(EINVAL, "Error marking booted successfully: " + std::string(cr.errMsg));
         LOG(INFO) << "Marked slot as booted successfully.";
@@ -173,6 +182,8 @@ Status cp_commitChanges() {
         if (!SetProperty("ota.warm_reset", "0")) {
             LOG(WARNING) << "Failed to reset the warm reset flag";
         }
+    } else {
+        LOG(ERROR) << "Failed to get BootControl HAL, not marking slot as successful.";
     }
     // Must take action for list of mounted checkpointed things here
     // To do this, we walk the list of mounted file systems.
@@ -198,7 +209,7 @@ Status cp_commitChanges() {
                     return error(EINVAL, "Failed to remount");
                 }
             }
-        } else if (fstab_rec->fs_mgr_flags.checkpoint_blk) {
+        } else if (fstab_rec->fs_mgr_flags.checkpoint_blk && isBow) {
             if (!setBowState(mount_rec.blk_device, "2"))
                 return error(EINVAL, "Failed to set bow state");
         }
@@ -209,6 +220,7 @@ Status cp_commitChanges() {
     if (!android::base::RemoveFileIfExists(kMetadataCPFile, &err_str))
         return error(err_str.c_str());
 
+    std::thread(DoCheckpointCommittedWork).detach();
     return Status::ok();
 }
 
@@ -254,12 +266,11 @@ bool cp_needsRollback() {
         if (content == "0") return true;
         if (content.substr(0, 3) == "-1 ") {
             std::string oldSuffix = content.substr(3);
-            sp<IBootControl> module = IBootControl::getService();
+            auto module = BootControlClient::WaitForService();
             std::string newSuffix;
 
             if (module) {
-                auto cb = [&newSuffix](hidl_string s) { newSuffix = s; };
-                module->getSuffix(module->getCurrentSlot(), cb);
+                newSuffix = module->GetSuffix(module->GetCurrentSlot());
                 if (oldSuffix == newSuffix) return true;
             }
         }
@@ -276,11 +287,11 @@ bool cp_needsCheckpoint() {
 
     bool ret;
     std::string content;
-    sp<IBootControl> module = IBootControl::getService();
+    auto module = BootControlClient::WaitForService();
 
     if (isCheckpointing) return isCheckpointing;
-
-    if (module && module->isSlotMarkedSuccessful(module->getCurrentSlot()) == BoolResult::FALSE) {
+    // In case of INVALID slot or other failures, we do not perform checkpoint.
+    if (module && !module->IsSlotMarkedSuccessful(module->GetCurrentSlot()).value_or(true)) {
         isCheckpointing = true;
         return true;
     }
@@ -386,7 +397,7 @@ Status cp_prepareCheckpoint() {
             LOG(INFO) << "Trimmed " << range.len << " bytes on " << mount_rec.mount_point << " in "
                       << nanoseconds_to_milliseconds(time) << "ms for checkpoint";
 
-            setBowState(mount_rec.blk_device, "1");
+            isBow &= setBowState(mount_rec.blk_device, "1");
         }
         if (fstab_rec->fs_mgr_flags.checkpoint_blk || fstab_rec->fs_mgr_flags.checkpoint_fs) {
             std::thread(cp_healthDaemon, std::string(mount_rec.mount_point),

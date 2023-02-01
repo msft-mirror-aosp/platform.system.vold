@@ -766,7 +766,7 @@ status_t ForkExecvpTimeout(const std::vector<std::string>& args, std::chrono::se
         }
         pid_t timer_pid = fork();
         if (timer_pid == 0) {
-            sleep(timeout.count());
+            std::this_thread::sleep_for(timeout);
             _exit(ETIMEDOUT);
         }
         if (timer_pid == -1) {
@@ -1160,14 +1160,6 @@ std::string BuildDataMiscDePath(const std::string& volumeUuid, userid_t userId) 
 std::string BuildDataUserCePath(const std::string& volumeUuid, userid_t userId) {
     // TODO: unify with installd path generation logic
     std::string data(BuildDataPath(volumeUuid));
-    if (volumeUuid.empty() && userId == 0) {
-        std::string legacy = StringPrintf("%s/data", data.c_str());
-        struct stat sb;
-        if (lstat(legacy.c_str(), &sb) == 0 && S_ISDIR(sb.st_mode)) {
-            /* /data/data is dir, return /data/data for legacy system */
-            return legacy;
-        }
-    }
     return StringPrintf("%s/user/%u", data.c_str(), userId);
 }
 
@@ -1185,6 +1177,12 @@ dev_t GetDevice(const std::string& path) {
     } else {
         return sb.st_dev;
     }
+}
+
+// Returns true if |path| exists and is a symlink.
+bool IsSymlink(const std::string& path) {
+    struct stat stbuf;
+    return lstat(path.c_str(), &stbuf) == 0 && S_ISLNK(stbuf.st_mode);
 }
 
 // Returns true if |path1| names the same existing file or directory as |path2|.
@@ -1450,7 +1448,10 @@ bool writeStringToFile(const std::string& payload, const std::string& filename) 
 status_t AbortFuseConnections() {
     namespace fs = std::filesystem;
 
-    for (const auto& itEntry : fs::directory_iterator("/sys/fs/fuse/connections")) {
+    static constexpr const char* kFuseConnections = "/sys/fs/fuse/connections";
+
+    std::error_code ec;
+    for (const auto& itEntry : fs::directory_iterator(kFuseConnections, ec)) {
         std::string fsPath = itEntry.path().string() + "/filesystem";
         std::string fs;
 
@@ -1468,6 +1469,11 @@ status_t AbortFuseConnections() {
         if (!ret) {
             LOG(WARNING) << "Failed to write to " << abortPath;
         }
+    }
+
+    if (ec) {
+        LOG(WARNING) << "Failed to iterate through " << kFuseConnections << ": "  << ec.message();
+        return -ec.value();
     }
 
     return OK;
@@ -1766,13 +1772,23 @@ std::pair<android::base::unique_fd, std::string> OpenDirInProcfs(std::string_vie
 }
 
 bool IsFuseBpfEnabled() {
-    std::string bpf_override = android::base::GetProperty("persist.sys.fuse.bpf.override", "");
-    if (bpf_override == "true") {
+    // TODO Once kernel supports flag, trigger off kernel flag unless
+    //      ro.fuse.bpf.enabled is explicitly set to false
+    bool enabled;
+    if (base::GetProperty("ro.fuse.bpf.is_running", "") != "")
+        enabled = base::GetBoolProperty("ro.fuse.bpf.is_running", false);
+    else if (base::GetProperty("persist.sys.fuse.bpf.override", "") != "")
+        enabled = base::GetBoolProperty("persist.sys.fuse.bpf.override", false);
+    else
+        enabled = base::GetBoolProperty("ro.fuse.bpf.enabled", false);
+
+    if (enabled) {
+        base::SetProperty("ro.fuse.bpf.is_running", "true");
         return true;
-    } else if (bpf_override == "false") {
+    } else {
+        base::SetProperty("ro.fuse.bpf.is_running", "false");
         return false;
     }
-    return base::GetBoolProperty("ro.fuse.bpf.enabled", false);
 }
 
 }  // namespace vold

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2015 The Android Open Source Project
+ * Copyright (C) 2022 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#ifndef ANDROID_VOLD_F2FS_H
-#define ANDROID_VOLD_F2FS_H
+#ifndef ANDROID_VOLD_NTFS_H
+#define ANDROID_VOLD_NTFS_H
 
 #include <utils/Errors.h>
 
@@ -23,15 +23,16 @@
 
 namespace android {
 namespace vold {
-namespace f2fs {
+namespace ntfs {
 
 bool IsSupported();
 
 status_t Check(const std::string& source);
-status_t Mount(const std::string& source, const std::string& target);
-status_t Format(const std::string& source, const std::string& zoned_device = "");
+status_t Mount(const std::string& source, const std::string& target, bool ro, bool remount,
+               bool executable, int ownerUid, int ownerGid, int permMask);
+status_t Format(const std::string& source, unsigned int numSectors);
 
-}  // namespace f2fs
+}  // namespace ntfs
 }  // namespace vold
 }  // namespace android
 
