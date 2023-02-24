@@ -89,12 +89,13 @@ void defaultkey_precreate_dm_device() {
         LOG(INFO) << "Not pre-creating userdata encryption device; device already exists";
         return;
     }
-    if (!dm.CreateEmptyDevice(kDmNameUserdata)) {
+
+    if (!dm.CreatePlaceholderDevice(kDmNameUserdata)) {
         LOG(ERROR) << "Failed to pre-create userdata metadata encryption device";
     }
 }
 
-static bool mount_via_fs_mgr(const char* mount_point, const char* blk_device) {
+static bool mount_via_fs_mgr(const char* mount_point, const char* blk_device, bool needs_encrypt) {
     // fs_mgr_do_mount runs fsck. Use setexeccon to run trusted
     // partitions in the fsck domain.
     if (setexeccon(android::vold::sFsckContext)) {
@@ -103,7 +104,8 @@ static bool mount_via_fs_mgr(const char* mount_point, const char* blk_device) {
     }
     auto mount_rc = fs_mgr_do_mount(&fstab_default, const_cast<char*>(mount_point),
                                     const_cast<char*>(blk_device), nullptr,
-                                    android::vold::cp_needsCheckpoint(), true);
+                                    needs_encrypt? false: android::vold::cp_needsCheckpoint(),
+                                    true);
     if (setexeccon(nullptr)) {
         PLOG(ERROR) << "Failed to clear setexeccon";
         return false;
@@ -116,7 +118,7 @@ static bool mount_via_fs_mgr(const char* mount_point, const char* blk_device) {
     return true;
 }
 
-static bool read_key(const std::string& metadata_key_dir, const KeyGeneration& gen,
+static bool read_key(const std::string& metadata_key_dir, const KeyGeneration& gen, bool first_key,
                      KeyBuffer* key) {
     if (metadata_key_dir.empty()) {
         LOG(ERROR) << "Failed to get metadata_key_dir";
@@ -128,7 +130,7 @@ static bool read_key(const std::string& metadata_key_dir, const KeyGeneration& g
     if (!MkdirsSync(dir, 0700)) return false;
     auto in_dsu = android::base::GetBoolProperty("ro.gsid.image_running", false);
     // !pathExists(dir) does not imply there's a factory reset when in DSU mode.
-    if (!pathExists(dir) && !in_dsu) {
+    if (!pathExists(dir) && !in_dsu && first_key) {
         auto delete_all = android::base::GetBoolProperty(
                 "ro.crypto.metadata_init_delete_all_keys.enabled", false);
         if (delete_all) {
@@ -192,7 +194,7 @@ static bool create_crypto_blk_dev(const std::string& dm_name, const std::string&
             LOG(ERROR) << "Failed to populate default-key device " << dm_name;
             return false;
         }
-        if (!dm.WaitForDevice(dm_name, 5s, crypto_blkdev)) {
+        if (!dm.WaitForDevice(dm_name, 20s, crypto_blkdev)) {
             LOG(ERROR) << "Failed to wait for default-key device " << dm_name;
             return false;
         }
@@ -288,7 +290,7 @@ bool fscrypt_mount_metadata_encrypted(const std::string& blk_device, const std::
     }
     auto gen = needs_encrypt ? makeGen(options) : neverGen();
     KeyBuffer key;
-    if (!read_key(default_metadata_key_dir, gen, &key)) {
+    if (!read_key(default_metadata_key_dir, gen, true, &key)) {
         LOG(ERROR) << "read_key failed in mountFstab";
         return false;
     }
@@ -306,7 +308,7 @@ bool fscrypt_mount_metadata_encrypted(const std::string& blk_device, const std::
     if (!zoned_device.empty()) {
         auto zoned_metadata_key_dir = data_rec->metadata_key_dir + "/zoned";
 
-        if (!read_key(zoned_metadata_key_dir, gen, &key)) {
+        if (!read_key(zoned_metadata_key_dir, gen, false, &key)) {
             LOG(ERROR) << "read_key failed with zoned device: " << zoned_device;
             return false;
         }
@@ -349,7 +351,7 @@ bool fscrypt_mount_metadata_encrypted(const std::string& blk_device, const std::
     }
 
     LOG(DEBUG) << "Mounting metadata-encrypted filesystem:" << mount_point;
-    mount_via_fs_mgr(mount_point.c_str(), crypto_blkdev.c_str());
+    mount_via_fs_mgr(mount_point.c_str(), crypto_blkdev.c_str(), needs_encrypt);
 
     // Record that there's at least one fstab entry with metadata encryption
     if (!android::base::SetProperty("ro.crypto.metadata.enabled", "true")) {
