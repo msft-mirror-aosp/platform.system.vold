@@ -23,6 +23,7 @@
 #include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/properties.h>
+#include <android-base/scopeguard.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 #include <android-base/unique_fd.h>
@@ -100,13 +101,21 @@ std::string GetFuseMountPathForUser(userid_t user_id, const std::string& relativ
 status_t CreateDeviceNode(const std::string& path, dev_t dev) {
     std::lock_guard<std::mutex> lock(kSecurityLock);
     const char* cpath = path.c_str();
-    status_t res = 0;
+    auto clearfscreatecon = android::base::make_scope_guard([] { setfscreatecon(nullptr); });
+    auto secontext = std::unique_ptr<char, void (*)(char*)>(nullptr, freecon);
+    char* tmp_secontext;
 
-    char* secontext = nullptr;
-    if (sehandle) {
-        if (!selabel_lookup(sehandle, &secontext, cpath, S_IFBLK)) {
-            setfscreatecon(secontext);
+    if (selabel_lookup(sehandle, &tmp_secontext, cpath, S_IFBLK) == 0) {
+        secontext.reset(tmp_secontext);
+        if (setfscreatecon(secontext.get()) != 0) {
+            LOG(ERROR) << "Failed to setfscreatecon for device node " << path;
+            return -EINVAL;
         }
+    } else if (errno == ENOENT) {
+        LOG(DEBUG) << "No selabel defined for device node " << path;
+    } else {
+        PLOG(ERROR) << "Failed to look up selabel for device node " << path;
+        return -errno;
     }
 
     mode_t mode = 0660 | S_IFBLK;
@@ -114,16 +123,10 @@ status_t CreateDeviceNode(const std::string& path, dev_t dev) {
         if (errno != EEXIST) {
             PLOG(ERROR) << "Failed to create device node for " << major(dev) << ":" << minor(dev)
                         << " at " << path;
-            res = -errno;
+            return -errno;
         }
     }
-
-    if (secontext) {
-        setfscreatecon(nullptr);
-        freecon(secontext);
-    }
-
-    return res;
+    return OK;
 }
 
 status_t DestroyDeviceNode(const std::string& path) {
@@ -449,29 +452,26 @@ status_t PrepareDir(const std::string& path, mode_t mode, uid_t uid, gid_t gid,
                     unsigned int attrs) {
     std::lock_guard<std::mutex> lock(kSecurityLock);
     const char* cpath = path.c_str();
+    auto clearfscreatecon = android::base::make_scope_guard([] { setfscreatecon(nullptr); });
+    auto secontext = std::unique_ptr<char, void (*)(char*)>(nullptr, freecon);
+    char* tmp_secontext;
 
-    char* secontext = nullptr;
-    if (sehandle) {
-        if (!selabel_lookup(sehandle, &secontext, cpath, S_IFDIR)) {
-            setfscreatecon(secontext);
+    if (selabel_lookup(sehandle, &tmp_secontext, cpath, S_IFDIR) == 0) {
+        secontext.reset(tmp_secontext);
+        if (setfscreatecon(secontext.get()) != 0) {
+            LOG(ERROR) << "Failed to setfscreatecon for directory " << path;
+            return -EINVAL;
         }
-    }
-
-    int res = fs_prepare_dir(cpath, mode, uid, gid);
-
-    if (secontext) {
-        setfscreatecon(nullptr);
-        freecon(secontext);
-    }
-
-    if (res) return -errno;
-    if (attrs) res = SetAttrs(path, attrs);
-
-    if (res == 0) {
-        return OK;
+    } else if (errno == ENOENT) {
+        LOG(DEBUG) << "No selabel defined for directory " << path;
     } else {
+        PLOG(ERROR) << "Failed to look up selabel for directory " << path;
         return -errno;
     }
+
+    if (fs_prepare_dir(cpath, mode, uid, gid) != 0) return -errno;
+    if (attrs && SetAttrs(path, attrs) != 0) return -errno;
+    return OK;
 }
 
 status_t ForceUnmount(const std::string& path) {
@@ -1771,24 +1771,45 @@ std::pair<android::base::unique_fd, std::string> OpenDirInProcfs(std::string_vie
     return {std::move(fd), std::move(linkPath)};
 }
 
-bool IsFuseBpfEnabled() {
-    // TODO Once kernel supports flag, trigger off kernel flag unless
-    //      ro.fuse.bpf.enabled is explicitly set to false
-    bool enabled;
-    if (base::GetProperty("ro.fuse.bpf.is_running", "") != "")
-        enabled = base::GetBoolProperty("ro.fuse.bpf.is_running", false);
-    else if (base::GetProperty("persist.sys.fuse.bpf.override", "") != "")
-        enabled = base::GetBoolProperty("persist.sys.fuse.bpf.override", false);
-    else
-        enabled = base::GetBoolProperty("ro.fuse.bpf.enabled", false);
+static bool IsPropertySet(const char* name, bool& value) {
+    if (base::GetProperty(name, "") == "") return false;
 
-    if (enabled) {
-        base::SetProperty("ro.fuse.bpf.is_running", "true");
-        return true;
-    } else {
-        base::SetProperty("ro.fuse.bpf.is_running", "false");
-        return false;
+    value = base::GetBoolProperty(name, false);
+    LOG(INFO) << "fuse-bpf is " << (value ? "enabled" : "disabled") << " because of property "
+              << name;
+    return true;
+}
+
+bool IsFuseBpfEnabled() {
+    // This logic is reproduced in packages/providers/MediaProvider/jni/FuseDaemon.cpp
+    // so changes made here must be reflected there
+    bool enabled = false;
+
+    if (IsPropertySet("ro.fuse.bpf.is_running", enabled)) return enabled;
+
+    if (!IsPropertySet("persist.sys.fuse.bpf.override", enabled) &&
+        !IsPropertySet("ro.fuse.bpf.enabled", enabled)) {
+        // If the kernel has fuse-bpf, /sys/fs/fuse/features/fuse_bpf will exist and have the
+        // contents 'supported\n' - see fs/fuse/inode.c in the kernel source
+        std::string contents;
+        const char* filename = "/sys/fs/fuse/features/fuse_bpf";
+        if (!base::ReadFileToString(filename, &contents)) {
+            LOG(INFO) << "fuse-bpf is disabled because " << filename << " cannot be read";
+            enabled = false;
+        } else if (contents == "supported\n") {
+            LOG(INFO) << "fuse-bpf is enabled because " << filename << " reads 'supported'";
+            enabled = true;
+        } else {
+            LOG(INFO) << "fuse-bpf is disabled because " << filename
+                      << " does not read 'supported'";
+            enabled = false;
+        }
     }
+
+    std::string value = enabled ? "true" : "false";
+    LOG(INFO) << "Setting ro.fuse.bpf.is_running to " << value;
+    base::SetProperty("ro.fuse.bpf.is_running", value);
+    return enabled;
 }
 
 }  // namespace vold
