@@ -35,7 +35,7 @@
 
 #include <linux/kdev_t.h>
 
-#include <ApexProperties.sysprop.h>
+#include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/parseint.h>
 #include <android-base/properties.h>
@@ -53,6 +53,7 @@
 #include <private/android_filesystem_config.h>
 
 #include <fscrypt/fscrypt.h>
+#include <libdm/dm.h>
 
 #include "AppFuseUtil.h"
 #include "FsCrypt.h"
@@ -68,6 +69,7 @@
 #include "model/EmulatedVolume.h"
 #include "model/ObbVolume.h"
 #include "model/PrivateVolume.h"
+#include "model/PublicVolume.h"
 #include "model/StubVolume.h"
 
 using android::OK;
@@ -88,6 +90,7 @@ using android::vold::IsVirtioBlkDevice;
 using android::vold::PrepareAndroidDirs;
 using android::vold::PrepareAppDirFromRoot;
 using android::vold::PrivateVolume;
+using android::vold::PublicVolume;
 using android::vold::Symlink;
 using android::vold::Unlink;
 using android::vold::UnmountTree;
@@ -346,25 +349,19 @@ void VolumeManager::listVolumes(android::vold::VolumeBase::Type type,
     }
 }
 
-int VolumeManager::forgetPartition(const std::string& partGuid, const std::string& fsUuid) {
+bool VolumeManager::forgetPartition(const std::string& partGuid, const std::string& fsUuid) {
     std::string normalizedGuid;
     if (android::vold::NormalizeHex(partGuid, normalizedGuid)) {
         LOG(WARNING) << "Invalid GUID " << partGuid;
-        return -1;
+        return false;
     }
 
-    bool success = true;
     std::string keyPath = android::vold::BuildKeyPath(normalizedGuid);
     if (unlink(keyPath.c_str()) != 0) {
         LOG(ERROR) << "Failed to unlink " << keyPath;
-        success = false;
+        return false;
     }
-    if (IsFbeEnabled()) {
-        if (!fscrypt_destroy_volume_keys(fsUuid)) {
-            success = false;
-        }
-    }
-    return success ? 0 : -1;
+    return true;
 }
 
 void VolumeManager::destroyEmulatedVolumesForUser(userid_t userId) {
@@ -457,6 +454,31 @@ int VolumeManager::onUserStarted(userid_t userId) {
 
     if (mStartedUsers.find(userId) == mStartedUsers.end()) {
         createEmulatedVolumesForUser(userId);
+        std::list<std::string> public_vols;
+        listVolumes(VolumeBase::Type::kPublic, public_vols);
+        for (const std::string& id : public_vols) {
+            PublicVolume* pvol = static_cast<PublicVolume*>(findVolume(id).get());
+            if (pvol->getState() != VolumeBase::State::kMounted) {
+                continue;
+            }
+            if (pvol->isVisible() == 0) {
+                continue;
+            }
+            userid_t mountUserId = pvol->getMountUserId();
+            if (userId == mountUserId) {
+                // No need to bind mount for the user that owns the mount
+                continue;
+            }
+            if (mountUserId != VolumeManager::Instance()->getSharedStorageUser(userId)) {
+                // No need to bind if the user does not share storage with the mount owner
+                continue;
+            }
+            auto bindMountStatus = pvol->bindMountForUser(userId);
+            if (bindMountStatus != OK) {
+                LOG(ERROR) << "Bind Mounting Public Volume: " << pvol << " for user: " << userId
+                           << "Failed. Error: " << bindMountStatus;
+            }
+        }
     }
 
     mStartedUsers.insert(userId);
@@ -593,11 +615,10 @@ bool scanProcProcesses(uid_t uid, userid_t userId, ScanProcCallback callback, vo
     struct dirent* de;
     std::string rootName;
     std::string pidName;
+    std::string exeName;
     int pidFd;
     int nsFd;
     struct stat sb;
-
-    static bool apexUpdatable = android::sysprop::ApexProperties::updatable().value_or(false);
 
     if (!(dir = opendir("/proc"))) {
         async_safe_format_log(ANDROID_LOG_ERROR, "vold", "Failed to opendir");
@@ -646,22 +667,18 @@ bool scanProcProcesses(uid_t uid, userid_t userId, ScanProcCallback callback, vo
             goto next;
         }
 
-        if (apexUpdatable) {
-            std::string exeName;
-            // When ro.apex.bionic_updatable is set to true,
-            // some early native processes have mount namespaces that are different
-            // from that of the init. Therefore, above check can't filter them out.
-            // Since the propagation type of / is 'shared', unmounting /storage
-            // for the early native processes affects other processes including
-            // init. Filter out such processes by skipping if a process is a
-            // non-Java process whose UID is < AID_APP_START. (The UID condition
-            // is required to not filter out child processes spawned by apps.)
-            if (!android::vold::Readlinkat(pidFd, "exe", &exeName)) {
-                goto next;
-            }
-            if (!StartsWith(exeName, "/system/bin/app_process") && sb.st_uid < AID_APP_START) {
-                goto next;
-            }
+        // Some early native processes have mount namespaces that are different
+        // from that of the init. Therefore, above check can't filter them out.
+        // Since the propagation type of / is 'shared', unmounting /storage
+        // for the early native processes affects other processes including
+        // init. Filter out such processes by skipping if a process is a
+        // non-Java process whose UID is < AID_APP_START. (The UID condition
+        // is required to not filter out child processes spawned by apps.)
+        if (!android::vold::Readlinkat(pidFd, "exe", &exeName)) {
+            goto next;
+        }
+        if (!StartsWith(exeName, "/system/bin/app_process") && sb.st_uid < AID_APP_START) {
+            goto next;
         }
 
         // We purposefully leave the namespace open across the fork
@@ -1195,4 +1212,69 @@ int VolumeManager::unmountAppFuse(uid_t uid, int mountId) {
 
 int VolumeManager::openAppFuseFile(uid_t uid, int mountId, int fileId, int flags) {
     return android::vold::OpenAppFuseFile(uid, mountId, fileId, flags);
+}
+
+android::status_t android::vold::GetStorageSize(int64_t* storageSize) {
+    // Start with the /data mount point from fs_mgr
+    auto entry = android::fs_mgr::GetEntryForMountPoint(&fstab_default, DATA_MNT_POINT);
+    if (entry == nullptr) {
+        LOG(ERROR) << "No mount point entry for " << DATA_MNT_POINT;
+        return EINVAL;
+    }
+
+    // Follow any symbolic links
+    std::string blkDevice = entry->blk_device;
+    std::string dataDevice;
+    if (!android::base::Realpath(blkDevice, &dataDevice)) {
+        dataDevice = blkDevice;
+    }
+
+    // Handle mapped volumes.
+    auto& dm = android::dm::DeviceMapper::Instance();
+    for (;;) {
+        auto parent = dm.GetParentBlockDeviceByPath(dataDevice);
+        if (!parent.has_value()) break;
+        dataDevice = *parent;
+    }
+
+    // Get the potential /sys/block entry
+    std::size_t leaf = dataDevice.rfind('/');
+    if (leaf == std::string::npos) {
+        LOG(ERROR) << "data device " << dataDevice << " is not a path";
+        return EINVAL;
+    }
+    if (dataDevice.substr(0, leaf) != "/dev/block") {
+        LOG(ERROR) << "data device " << dataDevice << " is not a block device";
+        return EINVAL;
+    }
+    std::string sysfs = std::string() + "/sys/block/" + dataDevice.substr(leaf + 1);
+
+    // Look for a directory in /sys/block containing size where the name is a shortened
+    // version of the name we now have
+    // Typically we start with something like /sys/block/sda2, and we want /sys/block/sda
+    // Note that this directory only contains actual disks, not partitions, so this is
+    // not going to find anything other than the disks
+    std::string size;
+    std::string sizeFile;
+    for (std::string sysfsDir = sysfs;; sysfsDir = sysfsDir.substr(0, sysfsDir.size() - 1)) {
+        if (sysfsDir.back() == '/') {
+            LOG(ERROR) << "Could not find valid block device from " << sysfs;
+            return EINVAL;
+        }
+        sizeFile = sysfsDir + "/size";
+        if (android::base::ReadFileToString(sizeFile, &size, true)) {
+            break;
+        }
+    }
+
+    // Read the size file and be done
+    std::stringstream ssSize(size);
+    ssSize >> *storageSize;
+    if (ssSize.fail()) {
+        LOG(ERROR) << sizeFile << " cannot be read as an integer";
+        return EINVAL;
+    }
+
+    *storageSize *= 512;
+    return OK;
 }

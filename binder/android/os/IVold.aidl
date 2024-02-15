@@ -66,6 +66,8 @@ interface IVold {
     void fstrim(int fstrimFlags, IVoldTaskListener listener);
     void runIdleMaint(boolean needGC, IVoldTaskListener listener);
     void abortIdleMaint(IVoldTaskListener listener);
+    // Returns the amount of storage lifetime used, as a percentage.
+    // (eg, 10 indicates 10% of lifetime used), or -1 on failure.
     int getStorageLifeTime();
     void setGCUrgentPace(int neededSegments, int minSegmentThreshold,
                          float dirtyReclaimRate, float reclaimWeight,
@@ -85,17 +87,16 @@ interface IVold {
 
     void setStorageBindingSeed(in byte[] seed);
 
-    void createUserKey(int userId, int userSerial, boolean ephemeral);
-    void destroyUserKey(int userId);
+    void createUserStorageKeys(int userId, boolean ephemeral);
+    void destroyUserStorageKeys(int userId);
 
-    void setUserKeyProtection(int userId, @utf8InCpp String secret);
+    void setCeStorageProtection(int userId, @utf8InCpp String secret);
 
     int[] getUnlockedUsers();
-    void unlockUserKey(int userId, int userSerial, @utf8InCpp String secret);
-    void lockUserKey(int userId);
+    void unlockCeStorage(int userId, @utf8InCpp String secret);
+    void lockCeStorage(int userId);
 
-    void prepareUserStorage(@nullable @utf8InCpp String uuid, int userId, int userSerial,
-                            int storageFlags);
+    void prepareUserStorage(@nullable @utf8InCpp String uuid, int userId, int storageFlags);
     void destroyUserStorage(@nullable @utf8InCpp String uuid, int userId, int storageFlags);
 
     void prepareSandboxForApp(in @utf8InCpp String packageName, int appId,
@@ -133,6 +134,13 @@ interface IVold {
     void bindMount(@utf8InCpp String sourceDir, @utf8InCpp String targetDir);
 
     void destroyDsuMetadataKey(@utf8InCpp String dsuSlot);
+
+    long getStorageSize();
+
+    // Returns the remaining storage lifetime as a percentage, rounded up as
+    // needed when the underlying hardware reports low precision. Returns -1
+    // on failure.
+    int getStorageRemainingLifetime();
 
     const int FSTRIM_FLAG_DEEP_TRIM = 1;
 
