@@ -22,6 +22,7 @@ import android.os.IVoldMountCallback;
 import android.os.IVoldTaskListener;
 
 /** {@hide} */
+@SensitiveData
 interface IVold {
     void setListener(IVoldListener listener);
 
@@ -90,10 +91,10 @@ interface IVold {
     void createUserStorageKeys(int userId, boolean ephemeral);
     void destroyUserStorageKeys(int userId);
 
-    void setCeStorageProtection(int userId, @utf8InCpp String secret);
+    void setCeStorageProtection(int userId, in byte[] secret);
 
     int[] getUnlockedUsers();
-    void unlockCeStorage(int userId, @utf8InCpp String secret);
+    void unlockCeStorage(int userId, in byte[] secret);
     void lockCeStorage(int userId);
 
     void prepareUserStorage(@nullable @utf8InCpp String uuid, int userId, int storageFlags);
