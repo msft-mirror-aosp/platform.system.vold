@@ -19,6 +19,7 @@
 
 #include <string.h>
 #include <memory>
+#include <type_traits>
 #include <vector>
 
 namespace android {
@@ -27,10 +28,16 @@ namespace vold {
 // Allocator that delegates useful work to standard one but zeroes data before deallocating.
 class ZeroingAllocator : public std::allocator<char> {
   public:
-    void deallocate(pointer p, size_type n) {
+    void deallocate(value_type* p, size_type n) {
         memset_explicit(p, 0, n);
         std::allocator<char>::deallocate(p, n);
     }
+
+    template <class Other>
+    struct rebind {
+        static_assert(std::is_same_v<char, Other>, "ZeroingAllocator is only defined for char");
+        using other = ZeroingAllocator;
+    };
 };
 
 // Char vector that zeroes memory when deallocating.

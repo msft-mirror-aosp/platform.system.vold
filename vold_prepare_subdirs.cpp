@@ -58,32 +58,32 @@ static bool prepare_dir_for_user(struct selabel_handle* sehandle, mode_t mode, u
                                  const std::string& path, uid_t user_id) {
     auto clearfscreatecon = android::base::make_scope_guard([] { setfscreatecon(nullptr); });
     auto secontext = std::unique_ptr<char, void (*)(char*)>(nullptr, freecon);
-    if (sehandle) {
-        char* tmp_secontext;
+    char* tmp_secontext;
 
-        if (selabel_lookup(sehandle, &tmp_secontext, path.c_str(), S_IFDIR) == 0) {
-            secontext.reset(tmp_secontext);
-
-            if (user_id != (uid_t)-1) {
-                if (selinux_android_context_with_level(secontext.get(), &tmp_secontext, user_id,
-                                                       (uid_t)-1) != 0) {
-                    PLOG(ERROR) << "Unable to create context with level for: " << path;
-                    return false;
-                }
-                secontext.reset(tmp_secontext);  // Free the context
+    if (selabel_lookup(sehandle, &tmp_secontext, path.c_str(), S_IFDIR) == 0) {
+        secontext.reset(tmp_secontext);
+        if (user_id != (uid_t)-1) {
+            if (selinux_android_context_with_level(secontext.get(), &tmp_secontext, user_id,
+                                                   (uid_t)-1) != 0) {
+                PLOG(ERROR) << "Unable to create context with level for: " << path;
+                return false;
             }
+            secontext.reset(tmp_secontext);
         }
+        if (setfscreatecon(secontext.get()) != 0) {
+            LOG(ERROR) << "Failed to setfscreatecon for directory " << path;
+            return false;
+        }
+    } else if (errno == ENOENT) {
+        LOG(DEBUG) << "No selabel defined for directory " << path;
+    } else {
+        PLOG(ERROR) << "Failed to look up selabel for directory " << path;
+        return false;
     }
 
     LOG(DEBUG) << "Setting up mode " << std::oct << mode << std::dec << " uid " << uid << " gid "
                << gid << " context " << (secontext ? secontext.get() : "null")
                << " on path: " << path;
-    if (secontext) {
-        if (setfscreatecon(secontext.get()) != 0) {
-            PLOG(ERROR) << "Unable to setfscreatecon for: " << path;
-            return false;
-        }
-    }
     if (fs_prepare_dir(path.c_str(), mode, uid, gid) != 0) {
         return false;
     }
@@ -144,7 +144,12 @@ static bool rmrf_contents(const std::string& path) {
 static bool prepare_apex_subdirs(struct selabel_handle* sehandle, const std::string& path) {
     if (!prepare_dir(sehandle, 0711, 0, 0, path + "/apexdata")) return false;
 
-    auto dirp = std::unique_ptr<DIR, int (*)(DIR*)>(opendir("/apex"), closedir);
+    // Since vold/vold_prepare_subdirs run in the bootstrap mount namespace
+    // we can't get the full list of APEXes by scanning /apex directory.
+    // Instead, we can look up /data/misc/apexdata for the list of APEXes,
+    // which is populated during `perform_apex_config` in init.
+    // Note: `init_user0` should be invoked after `perform_apex_config`.
+    auto dirp = std::unique_ptr<DIR, int (*)(DIR*)>(opendir("/data/misc/apexdata"), closedir);
     if (!dirp) {
         PLOG(ERROR) << "Unable to open apex directory";
         return false;
@@ -157,8 +162,6 @@ static bool prepare_apex_subdirs(struct selabel_handle* sehandle, const std::str
         // skip any starting with "."
         if (name[0] == '.') continue;
 
-        if (strchr(name, '@') != NULL) continue;
-
         if (!prepare_dir(sehandle, 0771, AID_ROOT, AID_SYSTEM, path + "/apexdata/" + name)) {
             return false;
         }
@@ -168,6 +171,10 @@ static bool prepare_apex_subdirs(struct selabel_handle* sehandle, const std::str
 
 static bool prepare_subdirs(const std::string& volume_uuid, int user_id, int flags) {
     struct selabel_handle* sehandle = selinux_android_file_context_handle();
+    if (!sehandle) {
+        LOG(ERROR) << "Failed to get SELinux file contexts handle";
+        return false;
+    }
 
     if (flags & android::os::IVold::STORAGE_FLAG_DE) {
         auto user_de_path = android::vold::BuildDataUserDePath(volume_uuid, user_id);
