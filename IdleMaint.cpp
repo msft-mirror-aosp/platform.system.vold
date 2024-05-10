@@ -436,7 +436,7 @@ int RunIdleMaint(bool needGC, const android::sp<android::os::IVoldTaskListener>&
     idle_maint_stat = IdleMaintStats::kStopped;
     lk.unlock();
 
-    cv_stop.notify_one();
+    cv_stop.notify_all();
 
     if (listener) {
         android::os::PersistableBundle extras;
@@ -507,6 +507,30 @@ int32_t GetStorageLifeTime() {
     return -1;
 }
 
+int32_t GetStorageRemainingLifetime() {
+    std::string path = getDevSysfsPath();
+    if (path.empty()) {
+        return -1;
+    }
+
+    std::string lifeTimeBasePath = path + "/health_descriptor/life_time_estimation_";
+
+    int32_t lifeTime = getLifeTime(lifeTimeBasePath + "c");
+    if (lifeTime == -1) {
+        int32_t lifeTimeA = getLifeTime(lifeTimeBasePath + "a");
+        int32_t lifeTimeB = getLifeTime(lifeTimeBasePath + "b");
+        lifeTime = std::max(lifeTimeA, lifeTimeB);
+        if (lifeTime <= 0) {
+            return -1;
+        }
+
+        // 1 = 0-10% used, 10 = 90-100% used. Subtract 1 so that a brand new
+        // device looks 0% used.
+        lifeTime = (lifeTime - 1) * 10;
+    }
+    return 100 - std::clamp(lifeTime, 0, 100);
+}
+
 void SetGCUrgentPace(int32_t neededSegments, int32_t minSegmentThreshold, float dirtyReclaimRate,
                      float reclaimWeight, int32_t gcPeriod, int32_t minGCSleepTime,
                      int32_t targetDirtyRatio) {
@@ -551,9 +575,9 @@ void SetGCUrgentPace(int32_t neededSegments, int32_t minSegmentThreshold, float 
 
     int32_t freeSegments = std::stoi(freeSegmentsStr);
     int32_t dirtySegments = std::stoi(dirtySegmentsStr);
-    int32_t reservedBlocks = std::stoi(ovpSegmentsStr) + std::stoi(reservedBlocksStr);
+    int32_t reservedSegments = std::stoi(ovpSegmentsStr) + std::stoi(reservedBlocksStr) / 512;
 
-    freeSegments = freeSegments > reservedBlocks ? freeSegments - reservedBlocks : 0;
+    freeSegments = freeSegments > reservedSegments ? freeSegments - reservedSegments : 0;
     int32_t totalSegments = freeSegments + dirtySegments;
     int32_t finalTargetSegments = 0;
 
@@ -630,7 +654,12 @@ static int32_t getLifeTimeWrite() {
         return -1;
     }
 
-    long long writeBytes = std::stoll(writeKbytesStr);
+    unsigned long long writeBytes = std::strtoull(writeKbytesStr.c_str(), NULL, 0);
+    /* Careful: values > LLONG_MAX can appear in the file due to a kernel bug. */
+    if (writeBytes / KBYTES_IN_SEGMENT > INT32_MAX) {
+        LOG(WARNING) << "Bad lifetime_write_kbytes: " << writeKbytesStr;
+        return -1;
+    }
     return writeBytes / KBYTES_IN_SEGMENT;
 }
 
