@@ -44,13 +44,10 @@
 
 #include "android/os/IVold.h"
 
-#define MANAGE_MISC_DIRS 0
-
 #include <cutils/fs.h>
 #include <cutils/properties.h>
 
 #include <fscrypt/fscrypt.h>
-#include <keyutils.h>
 #include <libdm/dm.h>
 
 #include <android-base/file.h>
@@ -76,7 +73,6 @@ using android::vold::retrieveOrGenerateKey;
 using android::vold::SetDefaultAcl;
 using android::vold::SetQuotaInherit;
 using android::vold::SetQuotaProjectId;
-using android::vold::writeStringToFile;
 using namespace android::fscrypt;
 using namespace android::dm;
 
@@ -106,15 +102,25 @@ std::set<userid_t> s_ephemeral_users;
 // New CE keys that haven't been committed to disk yet
 std::map<userid_t, KeyBuffer> s_new_ce_keys;
 
+// CE key fixation operations that have been deferred to checkpoint commit
+std::map<std::string, std::string> s_deferred_fixations;
+
 // The system DE encryption policy
 EncryptionPolicy s_device_policy;
 
-// Map user ids to encryption policies
-std::map<userid_t, EncryptionPolicy> s_de_policies;
-std::map<userid_t, EncryptionPolicy> s_ce_policies;
+// Struct that holds the EncryptionPolicy for each CE or DE key that is currently installed
+// (added to the kernel) for a particular user
+struct UserPolicies {
+    // Internal storage policy.  Exists whenever a user's UserPolicies exists at all, and used
+    // instead of a map entry keyed by an empty UUID to make this invariant explicit.
+    EncryptionPolicy internal;
+    // Adoptable storage policies, indexed by (nonempty) volume UUID
+    std::map<std::string, EncryptionPolicy> adoptable;
+};
 
-// CE key fixation operations that have been deferred to checkpoint commit
-std::map<std::string, std::string> s_deferred_fixations;
+// The currently installed CE and DE keys for each user.  Protected by VolumeManager::mCryptLock.
+std::map<userid_t, UserPolicies> s_ce_policies;
+std::map<userid_t, UserPolicies> s_de_policies;
 
 }  // namespace
 
@@ -316,18 +322,6 @@ static bool get_volume_file_encryption_options(EncryptionOptions* options) {
     return true;
 }
 
-static bool read_and_install_user_ce_key(userid_t user_id,
-                                         const android::vold::KeyAuthentication& auth) {
-    if (s_ce_policies.count(user_id) != 0) return true;
-    KeyBuffer ce_key;
-    if (!read_and_fixate_user_ce_key(user_id, auth, &ce_key)) return false;
-    EncryptionPolicy ce_policy;
-    if (!install_storage_key(DATA_MNT_POINT, s_data_options, ce_key, &ce_policy)) return false;
-    s_ce_policies[user_id] = ce_policy;
-    LOG(DEBUG) << "Installed ce key for user " << user_id;
-    return true;
-}
-
 // Prepare a directory without assigning it an encryption policy.  The directory
 // will inherit the encryption policy of its parent directory, or will be
 // unencrypted if the parent directory is unencrypted.
@@ -343,8 +337,37 @@ static bool prepare_dir(const std::string& dir, mode_t mode, uid_t uid, gid_t gi
 // Prepare a directory and assign it the given encryption policy.
 static bool prepare_dir_with_policy(const std::string& dir, mode_t mode, uid_t uid, gid_t gid,
                                     const EncryptionPolicy& policy) {
-    if (!prepare_dir(dir, mode, uid, gid)) return false;
-    if (IsFbeEnabled() && !EnsurePolicy(policy, dir)) return false;
+    if (android::vold::pathExists(dir)) {
+        if (!prepare_dir(dir, mode, uid, gid)) return false;
+        if (IsFbeEnabled() && !EnsurePolicy(policy, dir)) return false;
+    } else {
+        // If the directory does not yet exist, then create it under a temporary name, and only move
+        // it to the final name after it is fully prepared with an encryption policy and the desired
+        // file permissions.  This prevents the directory from being accessed before it is ready.
+        //
+        // Note: this relies on the SELinux file_contexts assigning the same type to the file path
+        // with the ".new" suffix as to the file path without the ".new" suffix.
+
+        const std::string tmp_dir = dir + ".new";
+        if (android::vold::pathExists(tmp_dir)) {
+            android::vold::DeleteDirContentsAndDir(tmp_dir);
+        }
+        if (!prepare_dir(tmp_dir, mode, uid, gid)) return false;
+        if (IsFbeEnabled() && !EnsurePolicy(policy, tmp_dir)) return false;
+
+        // On some buggy kernels, renaming a directory that is both encrypted and case-insensitive
+        // fails in some specific circumstances.  Unfortunately, these circumstances happen here
+        // when processing the "media" directory.  This was already fixed by kernel commit
+        // https://git.kernel.org/linus/b5639bb4313b9d45 ('f2fs: don't use casefolded comparison for
+        // "." and ".."').  But to support kernels that lack that fix, we use the below workaround.
+        // It bypasses the bug by making the encryption key of tmp_dir be loaded before the rename.
+        android::vold::pathExists(tmp_dir + "/subdir");
+
+        if (rename(tmp_dir.c_str(), dir.c_str()) != 0) {
+            PLOG(ERROR) << "Failed to rename " << tmp_dir << " to " << dir;
+            return false;
+        }
+    }
     return true;
 }
 
@@ -381,7 +404,7 @@ static bool create_de_key(userid_t user_id, bool ephemeral) {
         return false;
     EncryptionPolicy de_policy;
     if (!install_storage_key(DATA_MNT_POINT, s_data_options, de_key, &de_policy)) return false;
-    s_de_policies[user_id] = de_policy;
+    s_de_policies[user_id].internal = de_policy;
     LOG(INFO) << "Created DE key for user " << user_id;
     return true;
 }
@@ -394,23 +417,13 @@ static bool create_ce_key(userid_t user_id, bool ephemeral) {
             return false;
         // We don't store the CE key on disk here, since here we don't have the
         // secret needed to do so securely.  Instead, we cache it in memory for
-        // now, and we store it later in fscrypt_set_user_key_protection().
+        // now, and we store it later in fscrypt_set_ce_key_protection().
         s_new_ce_keys.insert({user_id, ce_key});
     }
     EncryptionPolicy ce_policy;
     if (!install_storage_key(DATA_MNT_POINT, s_data_options, ce_key, &ce_policy)) return false;
-    s_ce_policies[user_id] = ce_policy;
+    s_ce_policies[user_id].internal = ce_policy;
     LOG(INFO) << "Created CE key for user " << user_id;
-    return true;
-}
-
-static bool lookup_policy(const std::map<userid_t, EncryptionPolicy>& key_map, userid_t user_id,
-                          EncryptionPolicy* policy) {
-    auto refi = key_map.find(user_id);
-    if (refi == key_map.end()) {
-        return false;
-    }
-    *policy = refi->second;
     return true;
 }
 
@@ -453,8 +466,8 @@ static bool load_all_de_keys() {
         }
         EncryptionPolicy de_policy;
         if (!install_storage_key(DATA_MNT_POINT, s_data_options, de_key, &de_policy)) return false;
-        auto ret = s_de_policies.insert({user_id, de_policy});
-        if (!ret.second && ret.first->second != de_policy) {
+        const auto& [existing, is_new] = s_de_policies.insert({user_id, {de_policy, {}}});
+        if (!is_new && existing->second.internal != de_policy) {
             LOG(ERROR) << "DE policy for user" << user_id << " changed";
             return false;
         }
@@ -462,17 +475,6 @@ static bool load_all_de_keys() {
     }
     // fscrypt:TODO: go through all DE directories, ensure that all user dirs have the
     // correct policy set on them, and that no rogue ones exist.
-    return true;
-}
-
-// Attempt to reinstall CE keys for users that we think are unlocked.
-static bool try_reload_ce_keys() {
-    for (const auto& it : s_ce_policies) {
-        if (!android::vold::reloadKeyFromSessionKeyring(DATA_MNT_POINT, it.second)) {
-            LOG(ERROR) << "Failed to load CE key from session keyring for user " << it.first;
-            return false;
-        }
-    }
     return true;
 }
 
@@ -532,8 +534,8 @@ static bool prepare_special_dirs() {
     // On first boot, we'll be creating /data/data for the first time, and user
     // 0's CE key will be installed already since it was just created.  Take the
     // opportunity to also set the encryption policy of /data/data right away.
-    EncryptionPolicy ce_policy;
-    if (lookup_policy(s_ce_policies, 0, &ce_policy)) {
+    if (s_ce_policies.count(0) != 0) {
+        const EncryptionPolicy& ce_policy = s_ce_policies[0].internal;
         if (!prepare_dir_with_policy(data_data_dir, 0771, AID_SYSTEM, AID_SYSTEM, ce_policy)) {
             // Preparing /data/data failed, yet we had just generated a new CE
             // key because one wasn't stored.  Before erroring out, try deleting
@@ -599,31 +601,24 @@ bool fscrypt_init_user0() {
     // only prepare DE storage here, since user 0's CE key won't be installed
     // yet unless it was just created.  The framework will prepare the user's CE
     // storage later, once their CE key is installed.
-    if (!fscrypt_prepare_user_storage("", 0, 0, android::os::IVold::STORAGE_FLAG_DE)) {
+    if (!fscrypt_prepare_user_storage("", 0, android::os::IVold::STORAGE_FLAG_DE)) {
         LOG(ERROR) << "Failed to prepare user 0 storage";
         return false;
-    }
-
-    // In some scenarios (e.g. userspace reboot) we might unmount userdata
-    // without doing a hard reboot. If CE keys were stored in fs keyring then
-    // they will be lost after unmount. Attempt to re-install them.
-    if (IsFbeEnabled() && android::vold::isFsKeyringSupported()) {
-        if (!try_reload_ce_keys()) return false;
     }
 
     fscrypt_init_user0_done = true;
     return true;
 }
 
-bool fscrypt_vold_create_user_key(userid_t user_id, int serial, bool ephemeral) {
-    LOG(DEBUG) << "fscrypt_vold_create_user_key for " << user_id << " serial " << serial;
+// Creates the CE and DE keys for a new user.
+bool fscrypt_create_user_keys(userid_t user_id, bool ephemeral) {
+    LOG(DEBUG) << "fscrypt_create_user_keys for " << user_id;
     if (!IsFbeEnabled()) {
         return true;
     }
     // FIXME test for existence of key that is not loaded yet
     if (s_ce_policies.count(user_id) != 0) {
-        LOG(ERROR) << "Already exists, can't fscrypt_vold_create_user_key for " << user_id
-                   << " serial " << serial;
+        LOG(ERROR) << "Already exists, can't create keys for " << user_id;
         // FIXME should we fail the command?
         return true;
     }
@@ -633,51 +628,33 @@ bool fscrypt_vold_create_user_key(userid_t user_id, int serial, bool ephemeral) 
     return true;
 }
 
-// "Lock" all encrypted directories whose key has been removed.  This is needed
-// in the case where the keys are being put in the session keyring (rather in
-// the newer filesystem-level keyrings), because removing a key from the session
-// keyring doesn't affect inodes in the kernel's inode cache whose per-file key
-// was already set up.  So to remove the per-file keys and make the files
-// "appear encrypted", these inodes must be evicted.
-//
-// To do this, sync() to clean all dirty inodes, then drop all reclaimable slab
-// objects systemwide.  This is overkill, but it's the best available method
-// currently.  Don't use drop_caches mode "3" because that also evicts pagecache
-// for in-use files; all files relevant here are already closed and sync'ed.
-static void drop_caches_if_needed() {
-    if (android::vold::isFsKeyringSupported()) {
-        return;
-    }
-    sync();
-    if (!writeStringToFile("2", "/proc/sys/vm/drop_caches")) {
-        PLOG(ERROR) << "Failed to drop caches during key eviction";
-    }
-}
-
-static bool evict_ce_key(userid_t user_id) {
+// Evicts all the user's keys of one type from all volumes (internal and adoptable).
+// This evicts either CE keys or DE keys, depending on which map is passed.
+static bool evict_user_keys(std::map<userid_t, UserPolicies>& policy_map, userid_t user_id) {
     bool success = true;
-    EncryptionPolicy policy;
-    // If we haven't loaded the CE key, no need to evict it.
-    if (lookup_policy(s_ce_policies, user_id, &policy)) {
-        success &= android::vold::evictKey(DATA_MNT_POINT, policy);
-        drop_caches_if_needed();
+    auto it = policy_map.find(user_id);
+    if (it != policy_map.end()) {
+        const UserPolicies& policies = it->second;
+        success &= android::vold::evictKey(BuildDataPath(""), policies.internal);
+        for (const auto& [volume_uuid, policy] : policies.adoptable) {
+            success &= android::vold::evictKey(BuildDataPath(volume_uuid), policy);
+        }
+        policy_map.erase(it);
     }
-    s_ce_policies.erase(user_id);
-    s_new_ce_keys.erase(user_id);
     return success;
 }
 
-bool fscrypt_destroy_user_key(userid_t user_id) {
-    LOG(DEBUG) << "fscrypt_destroy_user_key(" << user_id << ")";
+// Evicts and destroys all CE and DE keys for a user.  This is called when the user is removed.
+bool fscrypt_destroy_user_keys(userid_t user_id) {
+    LOG(DEBUG) << "fscrypt_destroy_user_keys(" << user_id << ")";
     if (!IsFbeEnabled()) {
         return true;
     }
     bool success = true;
-    success &= evict_ce_key(user_id);
-    EncryptionPolicy de_policy;
-    success &= lookup_policy(s_de_policies, user_id, &de_policy) &&
-               android::vold::evictKey(DATA_MNT_POINT, de_policy);
-    s_de_policies.erase(user_id);
+
+    success &= evict_user_keys(s_ce_policies, user_id);
+    success &= evict_user_keys(s_de_policies, user_id);
+
     if (!s_ephemeral_users.erase(user_id)) {
         auto ce_path = get_ce_key_directory_path(user_id);
         if (!s_new_ce_keys.erase(user_id)) {
@@ -698,26 +675,13 @@ bool fscrypt_destroy_user_key(userid_t user_id) {
     return success;
 }
 
-static bool parse_hex(const std::string& hex, std::string* result) {
-    if (hex == "!") {
-        *result = "";
-        return true;
-    }
-    if (android::vold::HexToStr(hex, *result) != 0) {
-        LOG(ERROR) << "Invalid FBE hex string";  // Don't log the string for security reasons
-        return false;
-    }
-    return true;
-}
-
-static std::optional<android::vold::KeyAuthentication> authentication_from_hex(
-        const std::string& secret_hex) {
-    std::string secret;
-    if (!parse_hex(secret_hex, &secret)) return std::optional<android::vold::KeyAuthentication>();
-    if (secret.empty()) {
+static android::vold::KeyAuthentication authentication_from_secret(
+        const std::vector<uint8_t>& secret) {
+    std::string secret_str(secret.begin(), secret.end());
+    if (secret_str.empty()) {
         return kEmptyAuthentication;
     } else {
-        return android::vold::KeyAuthentication(secret);
+        return android::vold::KeyAuthentication(secret_str);
     }
 }
 
@@ -730,7 +694,7 @@ static std::string volume_secdiscardable_path(const std::string& volume_uuid) {
 }
 
 static bool read_or_create_volkey(const std::string& misc_path, const std::string& volume_uuid,
-                                  EncryptionPolicy* policy) {
+                                  UserPolicies& user_policies, EncryptionPolicy* policy) {
     auto secdiscardable_path = volume_secdiscardable_path(volume_uuid);
     std::string secdiscardable_hash;
     if (android::vold::pathExists(secdiscardable_path)) {
@@ -751,6 +715,7 @@ static bool read_or_create_volkey(const std::string& misc_path, const std::strin
     if (!retrieveOrGenerateKey(key_path, key_path + "_tmp", auth, makeGen(options), &key))
         return false;
     if (!install_storage_key(BuildDataPath(volume_uuid), options, key, policy)) return false;
+    user_policies.adoptable[volume_uuid] = *policy;
     return true;
 }
 
@@ -765,13 +730,12 @@ static bool destroy_volkey(const std::string& misc_path, const std::string& volu
 // re-encrypting the CE key upon upgrade from an Android version where the CE
 // key was stored with kEmptyAuthentication when the user didn't have an LSKF.
 // See the comments below for the different cases handled.
-bool fscrypt_set_user_key_protection(userid_t user_id, const std::string& secret_hex) {
-    LOG(DEBUG) << "fscrypt_set_user_key_protection " << user_id;
+bool fscrypt_set_ce_key_protection(userid_t user_id, const std::vector<uint8_t>& secret) {
+    LOG(DEBUG) << "fscrypt_set_ce_key_protection " << user_id;
     if (!IsFbeEnabled()) return true;
-    auto auth = authentication_from_hex(secret_hex);
-    if (!auth) return false;
-    if (auth->secret.empty()) {
-        LOG(ERROR) << "fscrypt_set_user_key_protection: secret must be nonempty";
+    auto auth = authentication_from_secret(secret);
+    if (auth.secret.empty()) {
+        LOG(ERROR) << "fscrypt_set_ce_key_protection: secret must be nonempty";
         return false;
     }
     // We shouldn't store any keys for ephemeral users.
@@ -798,7 +762,7 @@ bool fscrypt_set_user_key_protection(userid_t user_id, const std::string& secret
             // with the given secret.  This isn't expected, but in theory it
             // could happen if an upgrade is requested for a user more than once
             // due to a power-off or other interruption.
-            if (read_and_fixate_user_ce_key(user_id, *auth, &ce_key)) {
+            if (read_and_fixate_user_ce_key(user_id, auth, &ce_key)) {
                 LOG(WARNING) << "CE key is already protected by given secret";
                 return true;
             }
@@ -824,7 +788,7 @@ bool fscrypt_set_user_key_protection(userid_t user_id, const std::string& secret
     auto const paths = get_ce_key_paths(directory_path);
     std::string ce_key_path;
     if (!get_ce_key_new_path(directory_path, paths, &ce_key_path)) return false;
-    if (!android::vold::storeKeyAtomically(ce_key_path, user_key_temp, *auth, ce_key)) return false;
+    if (!android::vold::storeKeyAtomically(ce_key_path, user_key_temp, auth, ce_key)) return false;
 
     // Fixate the key, i.e. delete all other bindings of it.  (In practice this
     // just means the kEmptyAuthentication binding, if there is one.)  However,
@@ -858,37 +822,37 @@ void fscrypt_deferred_fixate_ce_keys() {
 
 std::vector<int> fscrypt_get_unlocked_users() {
     std::vector<int> user_ids;
-    for (const auto& it : s_ce_policies) {
-        user_ids.push_back(it.first);
+    for (const auto& [user_id, user_policies] : s_ce_policies) {
+        user_ids.push_back(user_id);
     }
     return user_ids;
 }
 
-// TODO: rename to 'install' for consistency, and take flags to know which keys to install
-bool fscrypt_unlock_user_key(userid_t user_id, int serial, const std::string& secret_hex) {
-    LOG(DEBUG) << "fscrypt_unlock_user_key " << user_id << " serial=" << serial;
-    if (IsFbeEnabled()) {
-        if (s_ce_policies.count(user_id) != 0) {
-            LOG(WARNING) << "Tried to unlock already-unlocked key for user " << user_id;
-            return true;
-        }
-        auto auth = authentication_from_hex(secret_hex);
-        if (!auth) return false;
-        if (!read_and_install_user_ce_key(user_id, *auth)) {
-            LOG(ERROR) << "Couldn't read key for " << user_id;
-            return false;
-        }
+// Unlocks internal CE storage for the given user.  This only unlocks internal storage, since
+// fscrypt_prepare_user_storage() has to be called for each adoptable storage volume anyway (since
+// the volume might have been absent when the user was created), and that handles the unlocking.
+bool fscrypt_unlock_ce_storage(userid_t user_id, const std::vector<uint8_t>& secret) {
+    LOG(DEBUG) << "fscrypt_unlock_ce_storage " << user_id;
+    if (!IsFbeEnabled()) return true;
+    if (s_ce_policies.count(user_id) != 0) {
+        LOG(WARNING) << "CE storage for user " << user_id << " is already unlocked";
+        return true;
     }
+    auto auth = authentication_from_secret(secret);
+    KeyBuffer ce_key;
+    if (!read_and_fixate_user_ce_key(user_id, auth, &ce_key)) return false;
+    EncryptionPolicy ce_policy;
+    if (!install_storage_key(DATA_MNT_POINT, s_data_options, ce_key, &ce_policy)) return false;
+    s_ce_policies[user_id].internal = ce_policy;
+    LOG(DEBUG) << "Installed CE key for user " << user_id;
     return true;
 }
 
-// TODO: rename to 'evict' for consistency
-bool fscrypt_lock_user_key(userid_t user_id) {
-    LOG(DEBUG) << "fscrypt_lock_user_key " << user_id;
-    if (IsFbeEnabled()) {
-        return evict_ce_key(user_id);
-    }
-    return true;
+// Locks CE storage for the given user.  This locks both internal and adoptable storage.
+bool fscrypt_lock_ce_storage(userid_t user_id) {
+    LOG(DEBUG) << "fscrypt_lock_ce_storage " << user_id;
+    if (!IsFbeEnabled()) return true;
+    return evict_user_keys(s_ce_policies, user_id);
 }
 
 static bool prepare_subdirs(const std::string& action, const std::string& volume_uuid,
@@ -902,10 +866,9 @@ static bool prepare_subdirs(const std::string& action, const std::string& volume
     return true;
 }
 
-bool fscrypt_prepare_user_storage(const std::string& volume_uuid, userid_t user_id, int serial,
-                                  int flags) {
+bool fscrypt_prepare_user_storage(const std::string& volume_uuid, userid_t user_id, int flags) {
     LOG(DEBUG) << "fscrypt_prepare_user_storage for volume " << escape_empty(volume_uuid)
-               << ", user " << user_id << ", serial " << serial << ", flags " << flags;
+               << ", user " << user_id << ", flags " << flags;
 
     // Internal storage must be prepared before adoptable storage, since the
     // user's volume keys are stored in their internal storage.
@@ -927,7 +890,6 @@ bool fscrypt_prepare_user_storage(const std::string& volume_uuid, userid_t user_
     if (flags & android::os::IVold::STORAGE_FLAG_DE) {
         // DE_sys key
         auto system_legacy_path = android::vold::BuildDataSystemLegacyPath(user_id);
-        auto misc_legacy_path = android::vold::BuildDataMiscLegacyPath(user_id);
         auto profiles_de_path = android::vold::BuildDataProfilesDePath(user_id);
 
         // DE_n key
@@ -938,14 +900,18 @@ bool fscrypt_prepare_user_storage(const std::string& volume_uuid, userid_t user_
         auto user_de_path = android::vold::BuildDataUserDePath(volume_uuid, user_id);
 
         if (IsFbeEnabled()) {
+            auto it = s_de_policies.find(user_id);
+            if (it == s_de_policies.end()) {
+                LOG(ERROR) << "Cannot find DE policy for user " << user_id;
+                return false;
+            }
+            UserPolicies& user_de_policies = it->second;
             if (volume_uuid.empty()) {
-                if (!lookup_policy(s_de_policies, user_id, &de_policy)) {
-                    LOG(ERROR) << "Cannot find DE policy for user " << user_id;
-                    return false;
-                }
+                de_policy = user_de_policies.internal;
             } else {
                 auto misc_de_empty_volume_path = android::vold::BuildDataMiscDePath("", user_id);
-                if (!read_or_create_volkey(misc_de_empty_volume_path, volume_uuid, &de_policy)) {
+                if (!read_or_create_volkey(misc_de_empty_volume_path, volume_uuid, user_de_policies,
+                                           &de_policy)) {
                     return false;
                 }
             }
@@ -953,11 +919,6 @@ bool fscrypt_prepare_user_storage(const std::string& volume_uuid, userid_t user_
 
         if (volume_uuid.empty()) {
             if (!prepare_dir(system_legacy_path, 0700, AID_SYSTEM, AID_SYSTEM)) return false;
-#if MANAGE_MISC_DIRS
-            if (!prepare_dir(misc_legacy_path, 0750, multiuser_get_uid(user_id, AID_SYSTEM),
-                             multiuser_get_uid(user_id, AID_EVERYBODY)))
-                return false;
-#endif
             if (!prepare_dir(profiles_de_path, 0771, AID_SYSTEM, AID_SYSTEM)) return false;
 
             if (!prepare_dir_with_policy(system_de_path, 0770, AID_SYSTEM, AID_SYSTEM, de_policy))
@@ -982,14 +943,18 @@ bool fscrypt_prepare_user_storage(const std::string& volume_uuid, userid_t user_
         auto user_ce_path = android::vold::BuildDataUserCePath(volume_uuid, user_id);
 
         if (IsFbeEnabled()) {
+            auto it = s_ce_policies.find(user_id);
+            if (it == s_ce_policies.end()) {
+                LOG(ERROR) << "Cannot find CE policy for user " << user_id;
+                return false;
+            }
+            UserPolicies& user_ce_policies = it->second;
             if (volume_uuid.empty()) {
-                if (!lookup_policy(s_ce_policies, user_id, &ce_policy)) {
-                    LOG(ERROR) << "Cannot find CE policy for user " << user_id;
-                    return false;
-                }
+                ce_policy = user_ce_policies.internal;
             } else {
                 auto misc_ce_empty_volume_path = android::vold::BuildDataMiscCePath("", user_id);
-                if (!read_or_create_volkey(misc_ce_empty_volume_path, volume_uuid, &ce_policy)) {
+                if (!read_or_create_volkey(misc_ce_empty_volume_path, volume_uuid, user_ce_policies,
+                                           &ce_policy)) {
                     return false;
                 }
             }
@@ -1062,7 +1027,6 @@ bool fscrypt_destroy_user_storage(const std::string& volume_uuid, userid_t user_
     if (flags & android::os::IVold::STORAGE_FLAG_DE) {
         // DE_sys key
         auto system_legacy_path = android::vold::BuildDataSystemLegacyPath(user_id);
-        auto misc_legacy_path = android::vold::BuildDataMiscLegacyPath(user_id);
         auto profiles_de_path = android::vold::BuildDataProfilesDePath(user_id);
 
         // DE_n key
@@ -1075,9 +1039,6 @@ bool fscrypt_destroy_user_storage(const std::string& volume_uuid, userid_t user_
         res &= destroy_dir(misc_de_path);
         if (volume_uuid.empty()) {
             res &= destroy_dir(system_legacy_path);
-#if MANAGE_MISC_DIRS
-            res &= destroy_dir(misc_legacy_path);
-#endif
             res &= destroy_dir(profiles_de_path);
             res &= destroy_dir(system_de_path);
             res &= destroy_dir(vendor_de_path);
@@ -1119,12 +1080,27 @@ static bool destroy_volume_keys(const std::string& directory_path, const std::st
     return res;
 }
 
+static void erase_volume_policies(std::map<userid_t, UserPolicies>& policy_map,
+                                  const std::string& volume_uuid) {
+    for (auto& [user_id, user_policies] : policy_map) {
+        user_policies.adoptable.erase(volume_uuid);
+    }
+}
+
+// Destroys all CE and DE keys for an adoptable storage volume that is permanently going away.
+// Requires VolumeManager::mCryptLock.
 bool fscrypt_destroy_volume_keys(const std::string& volume_uuid) {
+    if (!IsFbeEnabled()) return true;
     bool res = true;
     LOG(DEBUG) << "fscrypt_destroy_volume_keys for volume " << escape_empty(volume_uuid);
     auto secdiscardable_path = volume_secdiscardable_path(volume_uuid);
     res &= android::vold::runSecdiscardSingle(secdiscardable_path);
     res &= destroy_volume_keys("/data/misc_ce", volume_uuid);
     res &= destroy_volume_keys("/data/misc_de", volume_uuid);
+    // Drop the CE and DE policies stored in memory, as they are not needed anymore.  Note that it's
+    // not necessary to also evict the corresponding keys from the kernel, as that happens
+    // automatically as a result of the volume being unmounted.
+    erase_volume_policies(s_ce_policies, volume_uuid);
+    erase_volume_policies(s_de_policies, volume_uuid);
     return res;
 }

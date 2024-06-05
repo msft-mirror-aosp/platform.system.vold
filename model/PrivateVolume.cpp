@@ -171,11 +171,11 @@ status_t PrivateVolume::doMount() {
 
     // Verify that common directories are ready to roll
     if (PrepareDir(mPath + "/app", 0771, AID_SYSTEM, AID_SYSTEM) ||
-        PrepareDir(mPath + "/user", 0711, AID_SYSTEM, AID_SYSTEM) ||
-        PrepareDir(mPath + "/user_de", 0711, AID_SYSTEM, AID_SYSTEM) ||
-        PrepareDir(mPath + "/misc_ce", 0711, AID_SYSTEM, AID_SYSTEM) ||
-        PrepareDir(mPath + "/misc_de", 0711, AID_SYSTEM, AID_SYSTEM) ||
-        PrepareDir(mPath + "/media", 0770, AID_MEDIA_RW, AID_MEDIA_RW, attrs) ||
+        PrepareDir(mPath + "/user", 0511, AID_SYSTEM, AID_SYSTEM) ||
+        PrepareDir(mPath + "/user_de", 0511, AID_SYSTEM, AID_SYSTEM) ||
+        PrepareDir(mPath + "/misc_ce", 0511, AID_SYSTEM, AID_SYSTEM) ||
+        PrepareDir(mPath + "/misc_de", 0511, AID_SYSTEM, AID_SYSTEM) ||
+        PrepareDir(mPath + "/media", 0550, AID_MEDIA_RW, AID_MEDIA_RW, attrs) ||
         PrepareDir(mPath + "/media/0", 0770, AID_MEDIA_RW, AID_MEDIA_RW) ||
         PrepareDir(mPath + "/local", 0751, AID_ROOT, AID_ROOT) ||
         PrepareDir(mPath + "/local/tmp", 0771, AID_SHELL, AID_SHELL)) {
@@ -234,7 +234,7 @@ status_t PrivateVolume::doFormat(const std::string& fsType) {
             return -EIO;
         }
     } else if (resolvedFsType == "f2fs") {
-        if (f2fs::Format(mDmDevPath)) {
+        if (f2fs::Format(mDmDevPath, false, {})) {
             PLOG(ERROR) << getId() << " failed to format";
             return -EIO;
         }
