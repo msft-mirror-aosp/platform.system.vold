@@ -219,6 +219,8 @@ bool IsFuseBpfEnabled();
 // referenced inside the current process via the virtual procfs symlink returned here.
 std::pair<android::base::unique_fd, std::string> OpenDirInProcfs(std::string_view path);
 
+status_t PrepareMountDirForUser(userid_t user_id);
+
 }  // namespace vold
 }  // namespace android
 
