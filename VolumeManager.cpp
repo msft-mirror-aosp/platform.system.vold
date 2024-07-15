@@ -473,6 +473,13 @@ int VolumeManager::onUserStarted(userid_t userId) {
                 // No need to bind if the user does not share storage with the mount owner
                 continue;
             }
+            // Create mount directory for the user as there is a chance that no other Volume is
+            // mounted for the user (ex: if the user is just started), so /mnt/user/user_id  does
+            // not exist yet.
+            auto mountDirStatus = android::vold::PrepareMountDirForUser(userId);
+            if (mountDirStatus != OK) {
+                LOG(ERROR) << "Failed to create Mount Directory for user " << userId;
+            }
             auto bindMountStatus = pvol->bindMountForUser(userId);
             if (bindMountStatus != OK) {
                 LOG(ERROR) << "Bind Mounting Public Volume: " << pvol << " for user: " << userId
