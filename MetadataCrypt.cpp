@@ -247,10 +247,12 @@ static bool parse_options(const std::string& options_string, CryptoOptions* opti
 bool fscrypt_mount_metadata_encrypted(const std::string& blk_device, const std::string& mount_point,
                                       bool needs_encrypt, bool should_format,
                                       const std::string& fs_type, bool is_zoned,
-                                      const std::vector<std::string>& user_devices) {
+                                      const std::vector<std::string>& user_devices,
+                                      int64_t length) {
     LOG(DEBUG) << "fscrypt_mount_metadata_encrypted: " << mount_point
                << " encrypt: " << needs_encrypt << " format: " << should_format << " with "
-               << fs_type << " block device: " << blk_device << " with zoned " << is_zoned;
+               << fs_type << " block device: " << blk_device << " with zoned " << is_zoned
+               << " length: " << length;
 
     for (auto& device : user_devices) {
         LOG(DEBUG) << " - user devices: " << device;
@@ -338,7 +340,7 @@ bool fscrypt_mount_metadata_encrypted(const std::string& blk_device, const std::
             if (fs_type == "ext4") {
                 error = ext4::Format(crypto_blkdev, 0, mount_point);
             } else if (fs_type == "f2fs") {
-                error = f2fs::Format(crypto_blkdev, is_zoned, crypto_user_blkdev);
+                error = f2fs::Format(crypto_blkdev, is_zoned, crypto_user_blkdev, length);
             } else {
                 LOG(ERROR) << "Unknown filesystem type: " << fs_type;
                 return false;
