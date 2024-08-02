@@ -17,6 +17,7 @@
 #include "MetadataCrypt.h"
 #include "KeyBuffer.h"
 
+#include <fstream>
 #include <string>
 
 #include <fcntl.h>
@@ -244,6 +245,48 @@ static bool parse_options(const std::string& options_string, CryptoOptions* opti
     return true;
 }
 
+class EncryptionInProgress {
+  private:
+    std::string file_path_;
+    bool need_cleanup_ = false;
+
+  public:
+    EncryptionInProgress(const FstabEntry& entry) {
+        file_path_ = fs_mgr_metadata_encryption_in_progress_file_name(entry);
+    }
+
+    [[nodiscard]] bool Mark() {
+        {
+            std::ofstream touch(file_path_);
+            if (!touch.is_open()) {
+                PLOG(ERROR) << "Failed to mark metadata encryption in progress " << file_path_;
+                return false;
+            }
+            need_cleanup_ = true;
+        }
+        if (!android::vold::FsyncParentDirectory(file_path_)) return false;
+
+        LOG(INFO) << "Marked metadata encryption in progress (" << file_path_ << ")";
+        return true;
+    }
+
+    [[nodiscard]] bool Remove() {
+        need_cleanup_ = false;
+        if (unlink(file_path_.c_str()) != 0) {
+            PLOG(ERROR) << "Failed to clear metadata encryption in progress (" << file_path_ << ")";
+            return false;
+        }
+        if (!android::vold::FsyncParentDirectory(file_path_)) return false;
+
+        LOG(INFO) << "Cleared metadata encryption in progress (" << file_path_ << ")";
+        return true;
+    }
+
+    ~EncryptionInProgress() {
+        if (need_cleanup_) (void)Remove();
+    }
+};
+
 bool fscrypt_mount_metadata_encrypted(const std::string& blk_device, const std::string& mount_point,
                                       bool needs_encrypt, bool should_format,
                                       const std::string& fs_type, bool is_zoned,
@@ -334,6 +377,8 @@ bool fscrypt_mount_metadata_encrypted(const std::string& blk_device, const std::
     }
 
     if (needs_encrypt) {
+        EncryptionInProgress marker(*data_rec);
+        if (!marker.Mark()) return false;
         if (should_format) {
             status_t error;
 
@@ -362,6 +407,7 @@ bool fscrypt_mount_metadata_encrypted(const std::string& blk_device, const std::
                 return false;
             }
         }
+        if (!marker.Remove()) return false;
     }
 
     LOG(DEBUG) << "Mounting metadata-encrypted filesystem:" << mount_point;
