@@ -754,57 +754,6 @@ status_t ForkExecvp(const std::vector<std::string>& args, std::vector<std::strin
     return OK;
 }
 
-status_t ForkTimeout(int (*func)(void*), void* args, std::chrono::seconds timeout) {
-    int status;
-
-    // We're waiting on either the timeout or workload process to finish, so we're
-    // initially forking to get away from any other vold children
-    pid_t wait_timeout_pid = fork();
-    if (wait_timeout_pid == 0) {
-        pid_t pid = fork();
-        if (pid == 0) {
-            _exit(func(args));
-        }
-        if (pid == -1) {
-            _exit(EXIT_FAILURE);
-        }
-        pid_t timer_pid = fork();
-        if (timer_pid == 0) {
-            std::this_thread::sleep_for(timeout);
-            _exit(ETIMEDOUT);
-        }
-        if (timer_pid == -1) {
-            PLOG(ERROR) << "fork in ForkTimeout failed";
-            kill(pid, SIGTERM);
-            _exit(EXIT_FAILURE);
-        }
-        // Preserve the exit code of the first process to finish, and end the other
-        pid_t finished = wait(&status);
-        if (finished == pid) {
-            kill(timer_pid, SIGTERM);
-        } else {
-            kill(pid, SIGTERM);
-        }
-        if (!WIFEXITED(status)) {
-            _exit(ECHILD);
-        }
-        _exit(WEXITSTATUS(status));
-    }
-    if (waitpid(wait_timeout_pid, &status, 0) == -1) {
-        PLOG(ERROR) << "waitpid in ForkTimeout failed";
-        return -errno;
-    }
-    if (!WIFEXITED(status)) {
-        LOG(ERROR) << "Process did not exit normally, status: " << status;
-        return -ECHILD;
-    }
-    if (WEXITSTATUS(status)) {
-        LOG(ERROR) << "Process exited with code: " << WEXITSTATUS(status);
-        return WEXITSTATUS(status);
-    }
-    return OK;
-}
-
 status_t ForkExecvpTimeout(const std::vector<std::string>& args, std::chrono::seconds timeout,
                            char* context) {
     int status;

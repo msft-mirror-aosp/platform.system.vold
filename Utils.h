@@ -39,7 +39,6 @@ static const char* kVoldAppDataIsolationEnabled = "persist.sys.vold_app_data_iso
 static const char* kExternalStorageSdcardfs = "external_storage.sdcardfs.enabled";
 
 static constexpr std::chrono::seconds kUntrustedFsckSleepTime(45);
-static constexpr std::chrono::seconds kUntrustedMountSleepTime(20);
 
 /* SELinux contexts used depending on the block device type */
 extern char* sBlkidContext;
@@ -108,7 +107,6 @@ status_t ReadMetadataUntrusted(const std::string& path, std::string* fsType, std
                                std::string* fsLabel);
 
 /* Returns either WEXITSTATUS() status, or a negative errno */
-status_t ForkTimeout(int (*func)(void*), void* args, std::chrono::seconds timeout);
 status_t ForkExecvp(const std::vector<std::string>& args,
                     std::vector<std::string>* output = nullptr, char* context = nullptr);
 status_t ForkExecvpTimeout(const std::vector<std::string>& args, std::chrono::seconds timeout,
