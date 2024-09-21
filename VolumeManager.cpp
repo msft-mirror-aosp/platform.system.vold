@@ -1036,7 +1036,8 @@ int VolumeManager::unmountAll() {
              !StartsWith(test, "/mnt/scratch") &&
 #endif
              !StartsWith(test, "/mnt/vendor") && !StartsWith(test, "/mnt/product") &&
-             !StartsWith(test, "/mnt/installer") && !StartsWith(test, "/mnt/androidwritable")) ||
+             !StartsWith(test, "/mnt/installer") && !StartsWith(test, "/mnt/androidwritable") &&
+             !StartsWith(test, "/mnt/vm")) ||
             StartsWith(test, "/storage/")) {
             toUnmount.push_front(test);
         }
