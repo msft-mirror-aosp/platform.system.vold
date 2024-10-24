@@ -224,7 +224,7 @@ KeystoreOperation Keystore::begin(const std::string& key, const km::Authorizatio
 }
 
 void Keystore::earlyBootEnded() {
-    ::ndk::SpAIBinder binder(AServiceManager_getService(maintenance_service_name));
+    ::ndk::SpAIBinder binder(AServiceManager_waitForService(maintenance_service_name));
     auto maint_service = ks2_maint::IKeystoreMaintenance::fromBinder(binder);
 
     if (!maint_service) {
@@ -237,7 +237,7 @@ void Keystore::earlyBootEnded() {
 }
 
 void Keystore::deleteAllKeys() {
-    ::ndk::SpAIBinder binder(AServiceManager_getService(maintenance_service_name));
+    ::ndk::SpAIBinder binder(AServiceManager_waitForService(maintenance_service_name));
     auto maint_service = ks2_maint::IKeystoreMaintenance::fromBinder(binder);
 
     if (!maint_service) {
