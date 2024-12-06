@@ -810,15 +810,14 @@ bool fscrypt_set_ce_key_protection(userid_t user_id, const std::vector<uint8_t>&
         // kEmptyAuthentication are encrypted by the user's synthetic password.
         LOG(DEBUG) << "CE key already exists on-disk; re-protecting it with the given secret";
         if (!read_and_fixate_user_ce_key(user_id, kEmptyAuthentication, &ce_key)) {
-            LOG(ERROR) << "Failed to retrieve CE key for user " << user_id << " using empty auth";
             // Before failing, also check whether the key is already protected
-            // with the given secret.  This isn't expected, but in theory it
-            // could happen if an upgrade is requested for a user more than once
-            // due to a power-off or other interruption.
+            // with the given secret.
             if (read_and_fixate_user_ce_key(user_id, auth, &ce_key)) {
-                LOG(WARNING) << "CE key is already protected by given secret";
+                LOG(INFO) << "CE key is already protected by given secret.  Nothing to do.";
+                LOG(INFO) << "Errors above are for the attempt with empty auth and can be ignored.";
                 return true;
             }
+            LOG(ERROR) << "Failed to retrieve CE key for user " << user_id;
             // The key isn't protected by either kEmptyAuthentication or by
             // |auth|.  This should never happen, and there's nothing we can do
             // besides return an error.
