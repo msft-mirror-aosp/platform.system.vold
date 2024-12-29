@@ -159,6 +159,21 @@ volatile bool needsCheckpointWasCalled = false;
 // Protects isCheckpointing, needsCheckpointWasCalled and code that makes decisions based on status
 // of isCheckpointing
 std::mutex isCheckpointingLock;
+
+std::mutex listenersLock;
+std::vector<android::sp<android::system::vold::IVoldCheckpointListener>> listeners;
+}  // namespace
+
+void notifyCheckpointListeners() {
+    std::lock_guard<std::mutex> lock(listenersLock);
+
+    for (auto& listener : listeners) {
+        listener->onCheckpointingComplete();
+        listener = nullptr;
+    }
+
+    // Reclaim vector memory; we likely won't need it again.
+    listeners = std::vector<android::sp<android::system::vold::IVoldCheckpointListener>>();
 }
 
 Status cp_commitChanges() {
@@ -220,6 +235,8 @@ Status cp_commitChanges() {
     isCheckpointing = false;
     if (!android::base::RemoveFileIfExists(kMetadataCPFile, &err_str))
         return error(err_str.c_str());
+
+    notifyCheckpointListeners();
 
     std::thread(DoCheckpointCommittedWork).detach();
     return Status::ok();
@@ -300,6 +317,9 @@ bool cp_needsCheckpoint() {
     if (ret) {
         ret = content != "0";
         isCheckpointing = ret;
+        if (!isCheckpointing) {
+            notifyCheckpointListeners();
+        }
         return ret;
     }
     return false;
@@ -799,6 +819,21 @@ Status cp_markBootAttempt() {
 void cp_resetCheckpoint() {
     std::lock_guard<std::mutex> lock(isCheckpointingLock);
     needsCheckpointWasCalled = false;
+}
+
+bool cp_registerCheckpointListener(
+        android::sp<android::system::vold::IVoldCheckpointListener> listener) {
+    std::lock_guard<std::mutex> checkpointGuard(isCheckpointingLock);
+    if (needsCheckpointWasCalled && !isCheckpointing) {
+        // Either checkpoint already committed or we didn't need one
+        return false;
+    }
+
+    // Either we don't know whether we need a checkpoint or we're already checkpointing,
+    // so we need to save this listener to notify later.
+    std::lock_guard<std::mutex> listenersGuard(listenersLock);
+    listeners.push_back(std::move(listener));
+    return true;
 }
 
 }  // namespace vold
