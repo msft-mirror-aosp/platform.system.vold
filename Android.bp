@@ -43,6 +43,7 @@ cc_defaults {
         "libfs_mgr",
         "libsquashfs_utils",
         "libvold_binder",
+        "android.system.vold-V1-cpp",
     ],
     shared_libs: [
         "android.hardware.boot@1.0",
@@ -103,6 +104,11 @@ cc_library_headers {
     export_include_dirs: ["."],
 }
 
+vintf_fragment {
+    name: "android.system.vold-service.xml",
+    src: "android.system.vold-service.xml",
+}
+
 // Static library factored out to support testing
 cc_library_static {
     name: "libvold",
@@ -132,6 +138,7 @@ cc_library_static {
         "NetlinkManager.cpp",
         "Process.cpp",
         "Utils.cpp",
+        "VendorVoldNativeService.cpp",
         "VoldNativeService.cpp",
         "VoldNativeServiceValidation.cpp",
         "VoldUtil.cpp",
@@ -198,6 +205,7 @@ cc_binary {
             ],
         },
     },
+    vintf_fragment_modules: ["android.system.vold-service.xml"],
 }
 
 cc_binary {
