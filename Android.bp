@@ -143,6 +143,7 @@ cc_library_static {
         "VoldNativeServiceValidation.cpp",
         "VoldUtil.cpp",
         "VolumeManager.cpp",
+        "WriteBooster.cpp",
         "cryptfs.cpp",
         "fs/Exfat.cpp",
         "fs/Ext4.cpp",
