@@ -307,21 +307,21 @@ bool cp_needsCheckpoint() {
     std::string content;
     auto module = BootControlClient::WaitForService();
 
-    if (isCheckpointing) return isCheckpointing;
+    if (isCheckpointing) return true;
+
     // In case of INVALID slot or other failures, we do not perform checkpoint.
     if (module && !module->IsSlotMarkedSuccessful(module->GetCurrentSlot()).value_or(true)) {
         isCheckpointing = true;
         return true;
     }
     ret = android::base::ReadFileToString(kMetadataCPFile, &content);
-    if (ret) {
-        ret = content != "0";
-        isCheckpointing = ret;
-        if (!isCheckpointing) {
-            notifyCheckpointListeners();
-        }
-        return ret;
+    if (ret && content != "0") {
+        isCheckpointing = true;
+        return true;
     }
+
+    // Leave isCheckpointing false and notify listeners now that we know we don't need one
+    notifyCheckpointListeners();
     return false;
 }
 
