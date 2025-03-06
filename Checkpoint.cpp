@@ -136,13 +136,16 @@ Status cp_startCheckpoint(int retry) {
         return error(ENOTSUP, "Checkpoints not supported");
 
     if (retry < -1) return error(EINVAL, "Retry count must be more than -1");
-    std::string content = std::to_string(retry + 1);
+    std::string content;
     if (retry == -1) {
+        content = std::to_string(-1);
         auto module = BootControlClient::WaitForService();
         if (module) {
             std::string suffix = module->GetSuffix(module->GetCurrentSlot());
             if (!suffix.empty()) content += " " + suffix;
         }
+    } else {
+        content = std::to_string(retry + 1);
     }
     if (!android::base::WriteStringToFile(content, kMetadataCPFile))
         return error("Failed to write checkpoint file");
