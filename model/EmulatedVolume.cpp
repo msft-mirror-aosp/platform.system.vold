@@ -113,6 +113,32 @@ status_t EmulatedVolume::bindMountVolume(const EmulatedVolume& volume,
     return status;
 }
 
+std::shared_ptr<android::vold::VolumeBase> getSharedStorageVolume(int userId) {
+    userid_t sharedStorageUserId = VolumeManager::Instance()->getSharedStorageUser(userId);
+    if (sharedStorageUserId != USER_UNKNOWN) {
+        auto filter_fn = [&](const VolumeBase &vol) {
+            if (vol.getState() != VolumeBase::State::kMounted) {
+                // The volume must be mounted
+                return false;
+            }
+            if (vol.getType() != VolumeBase::Type::kEmulated) {
+                return false;
+            }
+            if (vol.getMountUserId() != sharedStorageUserId) {
+                return false;
+            }
+            if ((vol.getMountFlags() & EmulatedVolume::MountFlags::kPrimary) == 0) {
+                // We only care about the primary emulated volume, so not a private
+                // volume with an emulated volume stacked on top.
+                return false;
+            }
+            return true;
+        };
+        return VolumeManager::Instance()->findVolumeWithFilter(filter_fn);
+    }
+    return nullptr;
+}
+
 status_t EmulatedVolume::mountFuseBindMounts() {
     std::string androidSource;
     std::string label = getLabel();
@@ -192,49 +218,26 @@ status_t EmulatedVolume::mountFuseBindMounts() {
     //
     // This will ensure that any access to the volume for a specific user always
     // goes through a single FUSE daemon.
-    userid_t sharedStorageUserId = VolumeManager::Instance()->getSharedStorageUser(userId);
-    if (sharedStorageUserId != USER_UNKNOWN) {
-        auto filter_fn = [&](const VolumeBase& vol) {
-            if (vol.getState() != VolumeBase::State::kMounted) {
-                // The volume must be mounted
-                return false;
-            }
-            if (vol.getType() != VolumeBase::Type::kEmulated) {
-                return false;
-            }
-            if (vol.getMountUserId() != sharedStorageUserId) {
-                return false;
-            }
-            if ((vol.getMountFlags() & MountFlags::kPrimary) == 0) {
-                // We only care about the primary emulated volume, so not a private
-                // volume with an emulated volume stacked on top.
-                return false;
-            }
-            return true;
-        };
-        auto vol = VolumeManager::Instance()->findVolumeWithFilter(filter_fn);
-        if (vol != nullptr) {
-            auto sharedVol = static_cast<EmulatedVolume*>(vol.get());
-            // Bind mount this volume in the other user's primary volume
-            status = sharedVol->bindMountVolume(*this, pathsToUnmount);
-            if (status != OK) {
-                return status;
-            }
-            // And vice-versa
-            status = bindMountVolume(*sharedVol, pathsToUnmount);
-            if (status != OK) {
-                return status;
-            }
+    auto vol = getSharedStorageVolume(userId);
+    if (vol != nullptr) {
+        auto sharedVol = static_cast<EmulatedVolume*>(vol.get());
+        // Bind mount this volume in the other user's primary volume
+        status = sharedVol->bindMountVolume(*this, pathsToUnmount);
+        if (status != OK) {
+            return status;
+        }
+        // And vice-versa
+        status = bindMountVolume(*sharedVol, pathsToUnmount);
+        if (status != OK) {
+            return status;
         }
     }
+
     unmount_guard.Disable();
     return OK;
 }
 
-status_t EmulatedVolume::unmountFuseBindMounts() {
-    std::string label = getLabel();
-    int userId = getMountUserId();
-
+status_t EmulatedVolume::unbindSharedStorageMountPath() {
     if (!mSharedStorageMountPath.empty()) {
         LOG(INFO) << "Unmounting " << mSharedStorageMountPath;
         auto status = UnmountTree(mSharedStorageMountPath);
@@ -242,7 +245,25 @@ status_t EmulatedVolume::unmountFuseBindMounts() {
             LOG(ERROR) << "Failed to unmount " << mSharedStorageMountPath;
         }
         mSharedStorageMountPath = "";
+        return status;
     }
+    return OK;
+}
+
+
+status_t EmulatedVolume::unmountFuseBindMounts() {
+    std::string label = getLabel();
+    int userId = getMountUserId();
+
+    if (!mSharedStorageMountPath.empty()) {
+        unbindSharedStorageMountPath();
+        auto vol = getSharedStorageVolume(userId);
+        if (vol != nullptr) {
+            auto sharedVol = static_cast<EmulatedVolume*>(vol.get());
+            sharedVol->unbindSharedStorageMountPath();
+        }
+    }
+
     if (mUseSdcardFs || mAppDataIsolationEnabled) {
         std::string installerTarget(
                 StringPrintf("/mnt/installer/%d/%s/%d/Android/obb", userId, label.c_str(), userId));
